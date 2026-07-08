@@ -1,0 +1,7 @@
+{
+    "dependencies": ["."],
+    "graphs": {
+        "margenes-agent": "./src/agent/graph.py:make_graph"
+    },
+    "env": ".env"
+}

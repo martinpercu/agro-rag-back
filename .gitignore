@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Venv
+.venv/
+venv/
+.env
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ChromaDB (regenerable con scripts/ingest_magazine.py)
+data/vector/
+
+# Outputs locales (reports, exports, etc)
+tmp/
+
+# OS
+.DS_Store
+Thumbs.db

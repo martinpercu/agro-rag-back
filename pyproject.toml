@@ -1,0 +1,39 @@
+[project]
+name = "agroposta"
+version = "0.1.0"
+description = "Agente IA conversacional sobre la revista Márgenes Agropecuarios para productores argentinos"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi[standard]>=0.120.0",
+    "jinja2>=3.1.6",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "rank-bm25>=0.2.2",
+    "structlog>=24.0",
+    "pdfplumber>=0.11",
+    "pypdf>=5.0",
+    "chromadb>=0.5",
+    "openai>=1.50",
+    "langchain>=1.0.0",
+    "langchain-openai>=1.0.0",
+    "langchain-text-splitters>=0.3.0",
+    "langgraph>=1.0.0",
+    "fpdf2>=2.7",
+    "uvicorn>=0.30",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "ipykernel>=7.0.1",
+    "pytest>=9.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["*"]

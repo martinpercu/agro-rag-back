@@ -1,0 +1,92 @@
+[
+  {
+    "id": "soja-norte-costos",
+    "question": "Cuanto me sale sembrar soja de primera en zona norte?",
+    "expected_intent": "costos",
+    "expected_answer_contains": ["pag.", "US$/ha"],
+    "expected_answer_not_contains": ["no se", "no estoy seguro"],
+    "expected_sections_any": ["costos_margenes", "costos_operativos"],
+    "expected_cultivo_any": ["soja"],
+    "description": "Costo de soja 1a zona norte, debe traer datos en US$/ha y citar paginas"
+  },
+  {
+    "id": "trigo-2026-27-proyecciones",
+    "question": "Que se proyecta para trigo en la campana 2026/27?",
+    "expected_intent": "proyecciones",
+    "expected_answer_contains": ["pag.", "2026/27"],
+    "expected_answer_not_contains": ["no encontre"],
+    "expected_sections_any": ["proyecciones", "siembras"],
+    "expected_cultivo_any": ["trigo"],
+    "description": "Proyeccion trigo, debe mencionar campana 2026/27 y seccion proyecciones"
+  },
+  {
+    "id": "maiz-tardio-margen",
+    "question": "Cual es el margen bruto del maiz tardio?",
+    "expected_intent": "costos",
+    "expected_answer_contains": ["pag.", "US$/ha"],
+    "expected_answer_not_contains": ["no encontre"],
+    "expected_sections_any": ["costos_margenes"],
+    "expected_cultivo_any": ["maiz"],
+    "description": "Margen bruto maiz tardio, debe dar numero en US$/ha con cita de pag"
+  },
+  {
+    "id": "novillo-feedlot-ganaderia",
+    "question": "Cuanto cuesta un kilo de novillo en feedlot?",
+    "expected_intent": "ganaderia",
+    "expected_answer_contains": ["pag.", "US$/kg"],
+    "expected_answer_not_contains": ["3,50 US$/kg"],
+    "expected_sections_any": ["ganaderia_costos"],
+    "expected_cultivo_any": null,
+    "description": "Precio kilo novillo. CRITICO: el clasificador NO debe mandarlo a costos por la palabra 'cuesta'"
+  },
+  {
+    "id": "glifosato-tecnologia",
+    "question": "Cual es la relacion insumo producto del glifosato?",
+    "expected_intent": "tecnologia",
+    "expected_answer_contains": ["pag."],
+    "expected_answer_not_contains": ["no se"],
+    "expected_sections_any": ["tecnologia", "insumos_maquinaria"],
+    "expected_cultivo_any": null,
+    "description": "Glifosato: si no esta el ratio exacto, debe decir 'no encontre' y ofrecer alternativa"
+  },
+  {
+    "id": "fas-teorico-mercado",
+    "question": "Como viene el FAS teorico del girasol?",
+    "expected_intent": "mercado",
+    "expected_answer_contains": ["pag."],
+    "expected_answer_not_contains": [],
+    "expected_sections_any": ["fas_teorico", "mercado_precios", "analisis_mercado"],
+    "expected_cultivo_any": null,
+    "description": "FAS girasol: debe venir de seccion mercado/precios"
+  },
+  {
+    "id": "siembra-porcentaje",
+    "question": "Cual es la rentabilidad de siembras a porcentaje en campo arrendado?",
+    "expected_intent": "costos",
+    "expected_answer_contains": ["pag."],
+    "expected_answer_not_contains": [],
+    "expected_sections_any": ["siembras", "costos_margenes", "costos_operativos"],
+    "expected_cultivo_any": null,
+    "description": "Siembras a porcentaje: como tiene 'rentabilidad' y 'arrendado' el clasificador va a costos"
+  },
+  {
+    "id": "coloquial-rioplatense",
+    "question": "Che, la soja a cuanto esta?",
+    "expected_intent": "general",
+    "expected_answer_contains": ["pag."],
+    "expected_answer_not_contains": [],
+    "expected_sections_any": ["mercado_precios", "analisis_mercado", "fas_teorico", "siembras", "general"],
+    "expected_cultivo_any": null,
+    "description": "Pregunta coloquial sin keywords de mercado: cae en 'general' (sin filtro); igual trae info de precios"
+  },
+  {
+    "id": "vaga-ambigua",
+    "question": "Y que me podes decir?",
+    "expected_intent": "general",
+    "expected_answer_contains": [],
+    "expected_answer_not_contains": [],
+    "expected_sections_any": ["general", "costos_margenes", "mercado_precios", "proyecciones"],
+    "expected_cultivo_any": null,
+    "description": "Pregunta ambigua: clasificador cae en 'general', agente sin filtro de seccion"
+  }
+]
