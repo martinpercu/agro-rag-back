@@ -5,7 +5,6 @@ markdown con latencias, fuentes y tokens. Pensado para revision manual
 NO para CI (las golden questions del pytest son el regression formal).
 
 Uso:
-    cd agro-back
     uv run python scripts/compare_report.py
     # -> imprime tabla en stdout
     # -> guarda el reporte completo en tmp/compare_report.md
