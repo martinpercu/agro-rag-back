@@ -3,28 +3,27 @@
 Endpoints:
 - GET  /              -> healthcheck
 - GET  /stats         -> metricas del vector store
-- POST /chat          -> pregunta puntual, devuelve {answer, sources, intent}
-- POST /chat/stream   -> mismo, pero SSE token-por-token
 - POST /compare       -> corre las 6 strategies en paralelo y devuelve el comparison
-- POST /export-pdf    -> genera PDF a partir de la conversacion en memoria
+- POST /compare/stream -> SSE, corre N strategies en paralelo con streaming real
 """
 from __future__ import annotations
 
 import json
 import os
-import uuid
-from typing import Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from agent.graph import graph
-from agent.strategies.runner import run_compare
-from export.pdf_generator import render_conversation_pdf
+from agent.nodes.classifier import is_off_topic
+from agent.strategies.runner import (
+    get_all_strategies,
+    get_strategies_by_names,
+    run_compare,
+    run_compare_stream,
+)
 from ingestion.indexer import collection_stats
 
 load_dotenv()
@@ -42,53 +41,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Memoria volatil: en MVP 1 las sesiones viven en este dict y se pierden
-# al reiniciar el servidor. Suficiente para la demo.
-SESSIONS: dict[str, list[dict]] = {}
-
 
 # --------------------------------------------------------------------
 # Modelos
 # --------------------------------------------------------------------
 
-Role = Literal["user", "assistant"]
-
-
-class ChatRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=1000)
-    session_id: str | None = None
-
-
-class SourceItem(BaseModel):
-    pagina: int
-    seccion: str
-    cultivo: str | None = None
-    campana: str | None = None
-    tipo: str
-    score: float
-
-
-class ChatResponse(BaseModel):
-    session_id: str
-    intent: str
-    answer: str
-    sources: list[SourceItem]
-
-
-class MessageItem(BaseModel):
-    role: Role
-    content: str
-    sources: list[SourceItem] | None = None
-
-
-class ExportPdfRequest(BaseModel):
-    session_id: str
-
-
 class CompareRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=1000)
     history: list[dict] | None = None
     k: int | None = Field(default=6, ge=1, le=20)
+    lang: str = "es"
+
+
+class CompareStreamRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=1000)
+    enabled: list[str] | None = None
+    history: list[dict] | None = None
+    k: int | None = Field(default=6, ge=1, le=20)
+    lang: str = "es"
+    sem_bm25: int | None = Field(default=None, ge=1, le=40)  # ancho rama semantica de hybrid
+    lex_bm25: int | None = Field(default=None, ge=1, le=40)  # ancho rama BM25 de hybrid
+    temperature: float | None = Field(default=None, ge=0, le=1)  # temperatura del answerer
 
 
 # --------------------------------------------------------------------
@@ -106,73 +79,6 @@ def stats() -> dict:
 
 
 # --------------------------------------------------------------------
-# Chat
-# --------------------------------------------------------------------
-
-def _run_agent(question: str) -> dict:
-    if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
-    return graph.invoke({"question": question})
-
-
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
-    session_id = req.session_id or str(uuid.uuid4())
-    result = _run_agent(req.question)
-
-    answer = result.get("answer", "")
-    sources = [SourceItem(**s) for s in result.get("sources", [])]
-    intent = result.get("intent", "general")
-
-    SESSIONS.setdefault(session_id, []).append({"role": "user", "content": req.question})
-    SESSIONS[session_id].append({"role": "assistant", "content": answer, "sources": [s.model_dump() for s in sources]})
-
-    return ChatResponse(
-        session_id=session_id,
-        intent=intent,
-        answer=answer,
-        sources=sources,
-    )
-
-
-@app.post("/chat/stream")
-def chat_stream(req: ChatRequest) -> StreamingResponse:
-    """SSE: emite la respuesta del agente token por token.
-
-    Primero manda un evento 'sources' con las fuentes recuperadas, despues
-    eventos 'token' con el texto. Al final un evento 'done'.
-    """
-    session_id = req.session_id or str(uuid.uuid4())
-
-    if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
-
-    result = graph.invoke({"question": req.question})
-    sources = result.get("sources", [])
-    intent = result.get("intent", "general")
-    answer = result.get("answer", "")
-
-    # Guardamos en SESSIONS ANTES de empezar a streamear. Asi, si el cliente
-    # corta la conexion, la conversacion ya queda persistida para el PDF.
-    SESSIONS.setdefault(session_id, []).append({"role": "user", "content": req.question})
-    SESSIONS[session_id].append(
-        {"role": "assistant", "content": answer, "sources": sources}
-    )
-
-    def generate():
-        yield f"event: meta\ndata: {json.dumps({'session_id': session_id, 'intent': intent})}\n\n"
-        yield f"event: sources\ndata: {json.dumps({'sources': sources})}\n\n"
-
-        chunk_size = 24
-        for i in range(0, len(answer), chunk_size):
-            yield f"event: token\ndata: {json.dumps({'text': answer[i:i + chunk_size]})}\n\n"
-
-        yield f"event: done\ndata: {json.dumps({'session_id': session_id})}\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
-
-
-# --------------------------------------------------------------------
 # Comparador RAG: corre las 6 strategies en paralelo
 # --------------------------------------------------------------------
 
@@ -180,17 +86,7 @@ def chat_stream(req: ChatRequest) -> StreamingResponse:
 async def compare(req: CompareRequest) -> dict:
     """Corre las 6 strategies de retrieval en paralelo y devuelve todo lado a lado.
 
-    Body: {question, history?, k?}
-    Response: {
-        question, strategies: {
-            baseline: {answer, sources, items, metrics},
-            hybrid:   {...},
-            rerank:   {...},
-            query_rewrite: {...},
-            multi_query:   {...},
-            hyde:     {...},
-        }
-    }
+    Body: {question, history?, k?, lang?}
     """
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
@@ -198,37 +94,68 @@ async def compare(req: CompareRequest) -> dict:
     return result.to_dict()
 
 
-# --------------------------------------------------------------------
-# Export PDF
-# --------------------------------------------------------------------
+@app.post("/compare/stream")
+async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
+    """SSE: corre las strategies habilitadas en paralelo y streamea tokens.
 
-@app.post("/export-pdf")
-def export_pdf(req: ExportPdfRequest) -> StreamingResponse:
-    if req.session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail=f"sesion {req.session_id} no encontrada")
-    messages = SESSIONS[req.session_id]
-    pdf_bytes = render_conversation_pdf(messages, edition=EDITION)
-    filename = f"agroposta_{req.session_id[:8]}.pdf"
-    return StreamingResponse(
-        iter([pdf_bytes]),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    Body: {question, enabled?, history?, k?, lang?}
+
+    SSE events:
+      event: strategy_retrieve  -> {strategy, intent, sources, metrics}
+      event: strategy_token     -> {strategy, text}
+      event: strategy_done      -> {strategy, answer, sources, metrics}
+      event: strategy_error     -> {strategy, error}
+    """
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
+
+    # Guard: preguntas que no son agropecuarias se rechazan sin gastar nada
+    if is_off_topic(req.question):
+        msg = (
+            "Preguntame sobre costos, márgenes, cultivos o ganadería de la revista Márgenes Agropecuarios."
+            if req.lang == "es"
+            else "Ask me about costs, margins, crops or livestock from Márgenes Agropecuarios magazine."
+        )
+
+        async def _reject():
+            names = req.enabled or [s.name for s in get_all_strategies()]
+            for name in names:
+                yield f"event: strategy_error\ndata: {json.dumps({'strategy': name, 'error': msg})}\n\n"
+
+        return StreamingResponse(_reject(), media_type="text/event-stream")
+
+    all_strategies = get_all_strategies()
+    hybrid_kwargs: dict = {}
+    if req.sem_bm25 is not None:
+        hybrid_kwargs["chroma_top_k"] = req.sem_bm25
+    if req.lex_bm25 is not None:
+        hybrid_kwargs["bm25_top_k"] = req.lex_bm25
+    if req.enabled:
+        strategies = get_strategies_by_names(req.enabled, **hybrid_kwargs)
+    else:
+        names = [s.name for s in all_strategies]
+        strategies = get_strategies_by_names(names, **hybrid_kwargs)
+
+    async def _format_events():
+        async for msg in run_compare_stream(
+            req.question, req.history, req.k or 6, strategies, temperature=req.temperature
+        ):
+            name = msg["strategy"]
+            typ = msg["type"]
+            data = msg["data"]
+
+            if typ == "token":
+                yield f"event: strategy_token\ndata: {json.dumps({'strategy': name, 'text': data})}\n\n"
+            elif typ == "retrieve_done":
+                payload: dict = {"strategy": name, **data}
+                yield f"event: strategy_retrieve\ndata: {json.dumps(payload)}\n\n"
+            elif typ == "done":
+                payload = {"strategy": name, **data}
+                yield f"event: strategy_done\ndata: {json.dumps(payload)}\n\n"
+            elif typ == "error":
+                yield f"event: strategy_error\ndata: {json.dumps({'strategy': name, 'error': data})}\n\n"
+
+    return StreamingResponse(_format_events(), media_type="text/event-stream")
 
 
-# --------------------------------------------------------------------
-# Dev: inspeccionar / borrar sesiones
-# --------------------------------------------------------------------
 
-@app.get("/sessions/{session_id}")
-def get_session(session_id: str) -> dict:
-    if session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="sesion no encontrada")
-    return {"session_id": session_id, "messages": SESSIONS[session_id]}
-
-
-@app.delete("/sessions/{session_id}")
-def delete_session(session_id: str) -> dict:
-    if session_id in SESSIONS:
-        del SESSIONS[session_id]
-    return {"deleted": session_id}

@@ -43,6 +43,24 @@ def _classify(question: str) -> Intent:
             "ganadería",
             "carne",
             "kg de carne",
+            # English
+            "cattle",
+            "cow",
+            "cows",
+            "bull",
+            "heifer",
+            "steer",
+            "dairy",
+            "beef",
+            "meat",
+            "calf",
+            "calves",
+            "ranch",
+            "rancher",
+            "livestock",
+            "pasture",
+            "grazing",
+            "stocker",
         )
     ):
         return "ganaderia"
@@ -72,6 +90,25 @@ def _classify(question: str) -> Intent:
             "fertilizantes",
             "pulverizacion",
             "pulverización",
+            # English
+            "herbicide",
+            "fungicide",
+            "insecticide",
+            "pesticide",
+            "glyphosate",
+            "weed",
+            "weeds",
+            "resistant",
+            "resistance",
+            "seed",
+            "seeds",
+            "fertilizer",
+            "fertilizers",
+            "spray",
+            "spraying",
+            "technology",
+            "input",
+            "inputs",
         )
     ):
         return "tecnologia"
@@ -119,6 +156,26 @@ def _classify(question: str) -> Intent:
             "tarifa",
             "tarifas",
             "trilla",
+            # English
+            "cost",
+            "costs",
+            "margin",
+            "margins",
+            "rent",
+            "rental",
+            "expense",
+            "expenses",
+            "income",
+            "budget",
+            "investment",
+            "profit",
+            "profitability",
+            "dollars",
+            "usd",
+            "tillage",
+            "harvest",
+            "rate",
+            "rates",
         )
     ):
         return "costos"
@@ -137,6 +194,13 @@ def _classify(question: str) -> Intent:
             "2026/27",
             "2026 / 27",
             "2027",
+            # English
+            "projection",
+            "projections",
+            "forecast",
+            "outlook",
+            "next season",
+            "upcoming season",
         )
     ):
         return "proyecciones"
@@ -159,20 +223,77 @@ def _classify(question: str) -> Intent:
             "cotizacion",
             "cotización",
             "retenciones",
+            # English
+            "market",
+            "price",
+            "prices",
+            "export",
+            "exports",
+            "future",
+            "futures",
+            "board",
+            "quote",
+            "quotes",
+            "fas",
+            "withholding",
         )
     ):
         return "mercado"
 
-    # Siembras / porcentajes
+    # Siembras / porcentajes / actividades de cultivo
     if any(
         w in q
         for w in (
             "siembra",
             "siembras",
+            "sembrar",
+            "sembrado",
+            "sembrada",
+            "sembrando",
+            "siembro",
+            "cultivar",
+            "cultivando",
+            "cultivado",
+            "cultivo",
+            "cultivos",
+            "plantar",
+            "plantado",
+            "plantada",
+            "plantando",
+            "plantacion",
+            "plantación",
+            "cosechar",
+            "cosechando",
+            "cosechadora",
             "porcentaje",
             "a porcentaje",
             "campo propio",
             "campo arrendado",
+            "lote",
+            "lotes",
+            "chacra",
+            "chacras",
+            "huerta",
+            "huertas",
+            # English
+            "sow",
+            "sowing",
+            "plant",
+            "planting",
+            "planted",
+            "grow",
+            "growing",
+            "cultivate",
+            "crop",
+            "crops",
+            "planting",
+            "acreage",
+            "percentage",
+            "own land",
+            "rented land",
+            "crop area",
+            "field",
+            "fields",
         )
     ):
         return "siembras"
@@ -184,3 +305,106 @@ def classifier_node(state: AgentState) -> AgentState:
     question = state["question"]
     state["intent"] = _classify(question)
     return state
+
+
+def is_off_topic(question: str) -> bool:
+    """Determina si la pregunta NO es sobre temas agropecuarios.
+
+    Corre el clasificador existente primero (gratis, rule-based).
+    Si devuelve algo distinto de "general" -> es agro.
+    Si es "general" -> check extra con palabras clave agro.
+    """
+    intent = _classify(question)
+    if intent != "general":
+        return False
+
+    q = question.lower()
+    for kw in (
+        "campo",
+        "cultivo",
+        "clima",
+        "lluvia",
+        "sequia",
+        "sequía",
+        "revista",
+        "edicion",
+        "edición",
+        "margenes",
+        "márgenes",
+        "chacra",
+        "productor",
+        "kg",
+        "kilo",
+        "tonelada",
+        "hectarea",
+        "hectárea",
+        "ha ",
+        "qq ",
+        "usd",
+        "dolar",
+        "dólar",
+        "plaga",
+        "enfermedad",
+        # Cultivos
+        "soja",
+        "trigo",
+        "maiz",
+        "maíz",
+        "girasol",
+        "cebada",
+        "sorgo",
+        "colza",
+        "alpiste",
+        "avena",
+        "centeno",
+        "arroz",
+        "poroto",
+        "porotos",
+        "mani",
+        "maní",
+        "algodon",
+        "algodón",
+        "lino",
+        "lenteja",
+        "garbanzo",
+        "cartamo",
+        "cártamo",
+        # English
+        "field",
+        "farm",
+        "farmer",
+        "crop",
+        "weather",
+        "rain",
+        "drought",
+        "hail",
+        "magazine",
+        "ton",
+        "tonne",
+        "hectare",
+        "soybean",
+        "wheat",
+        "corn",
+        "maize",
+        "sunflower",
+        "barley",
+        "sorghum",
+        "canola",
+        "rapeseed",
+        "oats",
+        "rye",
+        "rice",
+        "cotton",
+        "flax",
+        "peanut",
+        "chickpea",
+        "lentil",
+        "pea",
+        "beans",
+        "potato",
+        "sugarcane",
+    ):
+        if kw in q:
+            return False
+
+    return True

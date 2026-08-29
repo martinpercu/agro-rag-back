@@ -13,18 +13,22 @@ from __future__ import annotations
 import time
 from typing import Callable
 
-from langchain_openai import OpenAIEmbeddings
 from openai import OpenAI
 
+from agent.llm import (
+    embedding_model as env_embedding_model,
+    get_chat_client,
+    get_embeddings,
+    llm_model,
+)
 from agent.nodes.classifier import _classify
 from agent.nodes.retriever import INTENT_TO_SECTION
-from agent.strategies.base import RetrievedItem, Strategy, StrategyResult
+from agent.strategies.base import RetrievedItem, Strategy, StrategyResult, TraceRecorder
 from agent.strategies.llm_retry import call_with_retry
 from ingestion.indexer import search
 
 
 DEFAULT_MODEL = "gpt-4.1-nano"
-DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_K = 6
 MAX_TOKENS = 300
 TEMPERATURE = 0.3
@@ -45,8 +49,8 @@ Parrafo hipotetico:"""
 
 
 def _default_embed_fn(text: str) -> list[float]:
-    """Default embed function: usa OpenAIEmbeddings."""
-    return OpenAIEmbeddings(model=DEFAULT_EMBEDDING_MODEL).embed_query(text)
+    """Default embed function: usa el embedding configurado (env)."""
+    return get_embeddings().embed_query(text)
 
 
 class HydeStrategy(Strategy):
@@ -54,18 +58,16 @@ class HydeStrategy(Strategy):
 
     def __init__(
         self,
-        model: str = DEFAULT_MODEL,
-        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        model: str | None = None,
+        embedding_model: str | None = None,
         client: OpenAI | None = None,
         embed_fn: Callable[[str], list[float]] | None = None,
     ):
-        self.model = model
-        self.embedding_model = embedding_model
-        self.client = client or OpenAI()
+        self.model = model or llm_model()
+        self.embedding_model = embedding_model or env_embedding_model()
+        self.client = client or get_chat_client()
         if embed_fn is None:
-            self._embed_fn = lambda text: OpenAIEmbeddings(  # noqa: E731
-                model=embedding_model
-            ).embed_query(text)
+            self._embed_fn = lambda text: get_embeddings(self.embedding_model).embed_query(text)
         else:
             self._embed_fn = embed_fn
 
@@ -75,9 +77,11 @@ class HydeStrategy(Strategy):
         history: list[dict] | None = None,
         k: int = DEFAULT_K,
     ) -> StrategyResult:
-        t0 = time.time()
+        tr = TraceRecorder()
         intent = _classify(question)
         allowed = INTENT_TO_SECTION.get(intent)
+        filtro = f", filtro={allowed}" if allowed else ", sin filtro de seccion"
+        tr.step("classify", f"intent={intent}{filtro}", at_t=time.monotonic())
 
         # 1) LLM genera el parrafo hipotetico (con retry ante rate limit)
         gen_in_tok = 0
@@ -103,17 +107,24 @@ class HydeStrategy(Strategy):
                 name=self.name,
                 items=[],
                 intent=intent,
-                retrieval_ms=(time.time() - t0) * 1000,
+                retrieval_ms=tr.steps[-1].acc_ms if tr.steps else 0.0,
                 extra={"error": f"llm_failed: {e}"},
+                trace=tr.steps,
             )
+        tr.step(
+            "llm_hypothetical",
+            f"chars={len(hypothetical)}, model={self.model}",
+            at_t=time.monotonic(),
+        )
 
         if not hypothetical:
             return StrategyResult(
                 name=self.name,
                 items=[],
                 intent=intent,
-                retrieval_ms=(time.time() - t0) * 1000,
+                retrieval_ms=tr.steps[-1].acc_ms if tr.steps else 0.0,
                 extra={"error": "llm_returned_empty"},
+                trace=tr.steps,
             )
 
         # 2) Embed el hipotetico
@@ -124,19 +135,34 @@ class HydeStrategy(Strategy):
                 name=self.name,
                 items=[],
                 intent=intent,
-                retrieval_ms=(time.time() - t0) * 1000,
+                retrieval_ms=tr.steps[-1].acc_ms if tr.steps else 0.0,
                 extra={"error": f"embedding_failed: {e}"},
+                trace=tr.steps,
             )
+        tr.step(
+            "embed_query",
+            f"model={self.embedding_model}, dims={len(query_vector)}",
+            at_t=time.monotonic(),
+        )
 
         # 3) Chroma search con el vector del hipotetico
+        timings: dict = {}
+        t_search = time.monotonic()
         if allowed is None:
-            hits = search(k=k, query_vector=query_vector)
+            hits = search(k=k, query_vector=query_vector, timings=timings)
         else:
             hits = search(
                 k=k,
                 where={"seccion": {"$in": allowed}},
                 query_vector=query_vector,
+                timings=timings,
             )
+        chroma_ms = timings.get("chroma_ms", 0) / 1000
+        tr.step(
+            "chroma_search",
+            f"k={k}, hits={len(hits)}",
+            at_t=t_search + chroma_ms,
+        )
 
         items = [
             RetrievedItem(
@@ -153,7 +179,7 @@ class HydeStrategy(Strategy):
             for rank, (chunk, score) in enumerate(hits)
         ]
 
-        elapsed_ms = (time.time() - t0) * 1000
+        elapsed_ms = tr.steps[-1].acc_ms if tr.steps else 0.0
 
         return StrategyResult(
             name=self.name,
@@ -169,4 +195,5 @@ class HydeStrategy(Strategy):
                 "hypothetical_preview": hypothetical[:200],
                 "filter_sections": allowed,
             },
+            trace=tr.steps,
         )

@@ -12,14 +12,12 @@ completa con tests + tuning de prompt en el Paso 4 propiamente dicho.
 """
 from __future__ import annotations
 
-import os
 import time
 
-from openai import OpenAI
-
+from agent.llm import get_chat_client, llm_model, seed_for_temperature
 from agent.nodes.classifier import _classify
 from agent.nodes.retriever import INTENT_TO_SECTION
-from agent.strategies.base import RetrievedItem, Strategy, StrategyResult
+from agent.strategies.base import RetrievedItem, Strategy, StrategyResult, TraceRecorder
 from agent.strategies.llm_retry import call_with_retry
 from ingestion.indexer import search
 
@@ -76,7 +74,7 @@ def _build_query(question: str, history: list[dict] | None) -> tuple[str, int, i
     if not history:
         return question, 0, 0, ""
 
-    client = OpenAI()
+    client = get_chat_client()
     prompt = REWRITE_PROMPT.format(
         history=_format_history(history),
         question=question,
@@ -84,10 +82,11 @@ def _build_query(question: str, history: list[dict] | None) -> tuple[str, int, i
     try:
         response = call_with_retry(
             client.chat.completions.create,
-            model=DEFAULT_MODEL,
+            model=llm_model(),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=MAX_TOKENS,
             temperature=TEMPERATURE,
+            seed=seed_for_temperature(TEMPERATURE),
         )
         content = (response.choices[0].message.content or "").strip()
         in_tok = response.usage.prompt_tokens if response.usage else 0
@@ -109,16 +108,26 @@ class QueryRewriteStrategy(Strategy):
         history: list[dict] | None = None,
         k: int = DEFAULT_K,
     ) -> StrategyResult:
-        t0 = time.time()
+        tr = TraceRecorder()
         rewritten, in_tok, out_tok, raw = _build_query(question, history)
+        changed = rewritten.strip().lower() != question.strip().lower()
+        tr.step(
+            "llm_rewrite",
+            f"changed={changed}, history={len(history) if history else 0}",
+            at_t=time.monotonic(),
+        )
         intent = _classify(rewritten)
         allowed = INTENT_TO_SECTION.get(intent)
+        filtro = f", filtro={allowed}" if allowed else ", sin filtro de seccion"
+        tr.step("classify", f"intent={intent}{filtro}", at_t=time.monotonic())
 
         # Retrieval con la pregunta reescrita
+        timings: dict = {}
+        t_search = time.monotonic()
         if allowed is None:
-            hits = search(rewritten, k=k)
+            hits = search(rewritten, k=k, timings=timings)
         else:
-            hits = search(rewritten, k=k, where={"seccion": {"$in": allowed}})
+            hits = search(rewritten, k=k, where={"seccion": {"$in": allowed}}, timings=timings)
 
         items = [
             RetrievedItem(
@@ -134,9 +143,20 @@ class QueryRewriteStrategy(Strategy):
             )
             for rank, (chunk, score) in enumerate(hits)
         ]
+        embed_ms = timings.get("embed_ms", 0) / 1000
+        chroma_ms = timings.get("chroma_ms", 0) / 1000
+        tr.step(
+            "embed_query",
+            f"model={timings.get('embed_model', '?')}, dims={timings.get('embed_dims', '?')}",
+            at_t=t_search + embed_ms,
+        )
+        tr.step(
+            "chroma_search",
+            f"k={k}, hits={len(hits)}",
+            at_t=t_search + embed_ms + chroma_ms,
+        )
 
-        elapsed_ms = (time.time() - t0) * 1000
-        changed = rewritten.strip().lower() != question.strip().lower()
+        elapsed_ms = tr.steps[-1].acc_ms if tr.steps else 0.0
 
         return StrategyResult(
             name=self.name,
@@ -146,11 +166,12 @@ class QueryRewriteStrategy(Strategy):
             llm_input_tokens=in_tok,
             llm_output_tokens=out_tok,
             extra={
-                "model": DEFAULT_MODEL,
+                "model": llm_model(),
                 "original_query": question,
                 "rewritten_query": rewritten,
                 "rewritten_changed": changed,
                 "history_used": len(history) if history else 0,
                 "filter_sections": allowed,
             },
+            trace=tr.steps,
         )

@@ -1,17 +1,21 @@
-"""Nodo answerer: genera la respuesta final con gpt-4.1-nano + system prompt rioplatense."""
+"""Nodo answerer: genera la respuesta final con el modelo de chat configurado."""
 from __future__ import annotations
 
 import os
 
 from dotenv import load_dotenv
-from openai import OpenAI
 
+from agent.llm import (
+    get_async_chat_client,
+    get_chat_client,
+    llm_model,
+    seed_for_temperature,
+)
 from agent.state import AgentState
 from agent.strategies.base import RetrievedItem
 
 load_dotenv()
 
-MODEL = "gpt-4.1-nano"
 MAX_TOKENS = 900
 TEMPERATURE = 0.2
 
@@ -156,32 +160,56 @@ def _format_sources_from_items(items: list[RetrievedItem]) -> list[dict]:
     return out
 
 
-def _call_openai(question: str, context: str) -> tuple[str, int, int]:
-    """Llamada comun al LLM. Devuelve (answer, in_tok, out_tok)."""
-    client = OpenAI()
-    response = client.chat.completions.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Pregunta del productor: {question}\n\n"
-                    f"Contexto de la revista:\n{context}\n\n"
-                    "Responde siguiendo tu personalidad y las reglas duras."
-                ),
-            },
-        ],
-    )
-    answer = response.choices[0].message.content or ""
-    in_tok = response.usage.prompt_tokens if response.usage else 0
-    out_tok = response.usage.completion_tokens if response.usage else 0
-    return answer, in_tok, out_tok
+async def stream_answer_async(
+    question: str,
+    items: list[RetrievedItem],
+    temperature: float | None = None,
+):
+    """Async streaming version de answer().
+
+    Yields tokens a medida que OpenAI los genera (async).
+    Despues de la iteracion, usage contiene {input_tokens, output_tokens}.
+    """
+    usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+    temp = temperature if temperature is not None else TEMPERATURE
+
+    async def _generate():
+        if not items:
+            yield "En esta edicion no encontre informacion relevante para responder esto."
+            return
+
+        context = _format_context_from_items(items)
+        client = get_async_chat_client()
+        response = await client.chat.completions.create(
+            model=llm_model(),
+            max_tokens=MAX_TOKENS,
+            temperature=temp,
+            seed=seed_for_temperature(temp),
+            stream=True,
+            stream_options={"include_usage": True},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Pregunta del productor: {question}\n\n"
+                        f"Contexto de la revista:\n{context}\n\n"
+                        "Responde siguiendo tu personalidad y las reglas duras."
+                    ),
+                },
+            ],
+        )
+        async for chunk in response:
+            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+            if chunk.usage:
+                usage["input_tokens"] = chunk.usage.prompt_tokens or 0
+                usage["output_tokens"] = chunk.usage.completion_tokens or 0
+
+    return _generate(), usage
 
 
-def answer(question: str, items: list[RetrievedItem]) -> dict:
+def answer(question: str, items: list[RetrievedItem], temperature: float | None = None) -> dict:
     """API limpia para el runner del comparador: toma items y devuelve answer + sources + tokens.
 
     Devuelve: {answer, sources, input_tokens, output_tokens}
@@ -195,9 +223,30 @@ def answer(question: str, items: list[RetrievedItem]) -> dict:
             "input_tokens": 0,
             "output_tokens": 0,
         }
+    temp = temperature if temperature is not None else TEMPERATURE
     context = _format_context_from_items(items)
     sources = _format_sources_from_items(items)
-    answer_text, in_tok, out_tok = _call_openai(question, context)
+    client = get_chat_client()
+    response = client.chat.completions.create(
+        model=llm_model(),
+        max_tokens=MAX_TOKENS,
+        temperature=temp,
+        seed=seed_for_temperature(temp),
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Pregunta del productor: {question}\n\n"
+                    f"Contexto de la revista:\n{context}\n\n"
+                    "Responde siguiendo tu personalidad y las reglas duras."
+                ),
+            },
+        ],
+    )
+    answer_text = response.choices[0].message.content or ""
+    in_tok = response.usage.prompt_tokens if response.usage else 0
+    out_tok = response.usage.completion_tokens if response.usage else 0
     return {
         "answer": answer_text,
         "sources": sources,

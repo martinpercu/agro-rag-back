@@ -1,20 +1,36 @@
-"""Indexa chunks en ChromaDB con embeddings de OpenAI."""
+"""Indexa chunks en ChromaDB con embeddings del provider configurado.
+
+El provider (OpenAI por default, o un servidor OpenAI-compatible como
+LM Studio) y el modelo de embeddings se configuran via env vars en
+agent.llm. El nombre de la coleccion se deriva del modelo de embeddings
+para poder tener varios vector stores (por ejemplo uno por modelo en el
+bakeoff) sin mezclar dimensiones.
+"""
 
 from __future__ import annotations
 
-import os
+import threading
+import time
 from pathlib import Path
 
 import chromadb
 from chromadb.config import Settings
 from dotenv import load_dotenv
-from langchain_openai import OpenAIEmbeddings
 
+from agent.llm import collection_name, get_embeddings
 from schemas import Chunk
 
 load_dotenv()
 
-COLLECTION_NAME = "margenes_agropecuarios"
+# Singleton de clientes por path + lock de operaciones: las strategies
+# corren en paralelo (asyncio.to_thread) y ChromaDB no es thread-safe.
+# Crear un PersistentClient por llamada en paralelo produce errores
+# de "tenant" (carrera en la creacion del sqlite). Un solo cliente
+# compartido + lock serializa el acceso al vector store (muy rapido
+# comparado con las llamadas LLM).
+_clients: dict[str, chromadb.PersistentClient] = {}
+_clients_lock = threading.Lock()
+_ops_lock = threading.Lock()
 
 
 def get_chroma_path(base: Path | None = None) -> Path:
@@ -25,26 +41,25 @@ def get_chroma_path(base: Path | None = None) -> Path:
 
 
 def get_client(base: Path | None = None) -> chromadb.PersistentClient:
-    return chromadb.PersistentClient(
-        path=str(get_chroma_path(base)),
-        settings=Settings(anonymized_telemetry=False),
-    )
+    path = str(get_chroma_path(base))
+    with _clients_lock:
+        client = _clients.get(path)
+        if client is None:
+            client = chromadb.PersistentClient(
+                path=path,
+                settings=Settings(anonymized_telemetry=False),
+            )
+            _clients[path] = client
+        return client
 
 
 def get_collection(base: Path | None = None) -> chromadb.Collection:
     client = get_client(base)
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
-    )
-
-
-def get_embeddings() -> OpenAIEmbeddings:
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError(
-            "OPENAI_API_KEY no encontrada. Defina la variable de entorno o cree un .env en la raiz del proyecto."
+    with _ops_lock:
+        return client.get_or_create_collection(
+            name=collection_name(),
+            metadata={"hnsw:space": "cosine"},
         )
-    return OpenAIEmbeddings(model="text-embedding-3-small")
 
 
 def _sanitize_metadata(meta: dict) -> dict:
@@ -93,23 +108,41 @@ def search(
     where: dict | None = None,
     base: Path | None = None,
     query_vector: list[float] | None = None,
+    timings: dict | None = None,
 ) -> list[tuple[Chunk, float]]:
     """Devuelve los k chunks mas similares, con score.
 
     Acepta una `query` (string) o un `query_vector` (lista de floats)
     pre-computado. Si se pasan ambos o ninguno, error.
+    Si `timings` es un dict, lo llena con {"embed_ms", "chroma_ms",
+    "embed_model"} para el trace de las strategies.
     """
     if (query is None) == (query_vector is None):
         raise ValueError("search: pasar exactamente uno de `query` o `query_vector`")
     embeddings_fn = get_embeddings()
     collection = get_collection(base)
+    embed_ms = 0.0
     if query_vector is None:
+        t_embed = time.time()
         query_vector = embeddings_fn.embed_query(query)  # type: ignore[arg-type]
-    result = collection.query(
-        query_embeddings=[query_vector],
-        n_results=k,
-        where=where,
-    )
+        embed_ms = (time.time() - t_embed) * 1000
+    with _ops_lock:
+        t_chroma = time.time()
+        result = collection.query(
+            query_embeddings=[query_vector],
+            n_results=k,
+            where=where,
+        )
+        chroma_ms = (time.time() - t_chroma) * 1000
+    if timings is not None:
+        timings.update(
+            {
+                "embed_ms": embed_ms,
+                "chroma_ms": chroma_ms,
+                "embed_model": embeddings_fn.model,
+                "embed_dims": len(query_vector) if query_vector else None,
+            }
+        )
     out: list[tuple[Chunk, float]] = []
     for i, cid in enumerate(result["ids"][0]):
         meta = result["metadatas"][0][i]
@@ -124,8 +157,9 @@ def search(
 def collection_stats(base: Path | None = None) -> dict:
     """Metricas basicas del vector store."""
     collection = get_collection(base)
-    count = collection.count()
-    metadatas = collection.get(include=["metadatas"]).get("metadatas", [])
+    with _ops_lock:
+        count = collection.count()
+        metadatas = collection.get(include=["metadatas"]).get("metadatas", [])
     by_section: dict[str, int] = {}
     by_tipo: dict[str, int] = {}
     by_cultivo: dict[str, int] = {}

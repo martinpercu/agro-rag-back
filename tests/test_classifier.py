@@ -17,6 +17,9 @@ CASES = [
     ("Que herbicida uso para rama negra?", "tecnologia"),
     ("Cuales son los arrendamientos en zona nucleo?", "costos"),
     ("Hicimos la siembra a porcentaje, como me fue?", "siembras"),
+    ("Que conviene sembrar en esta zona?", "siembras"),
+    ("Cuando plantar girasol?", "siembras"),
+    ("Que cultivo conviene despues de trigo?", "siembras"),
     ("Que pasa con el clima y la humedad del suelo?", "general"),
 ]
 

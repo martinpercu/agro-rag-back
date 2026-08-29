@@ -6,8 +6,6 @@ from unittest.mock import patch
 import pytest
 
 from agent.strategies.hybrid import (
-    _BM25_TOP_K,
-    _CHROMA_TOP_K,
     _RRF_K,
     HybridStrategy,
     _rrf_merge,
@@ -141,10 +139,31 @@ def test_hybrid_extra_metadata_populated():
 
     extra = result.extra
     assert extra["rrf_k"] == _RRF_K
-    assert extra["bm25_top_n"] == _BM25_TOP_K
-    assert extra["chroma_top_n"] == _CHROMA_TOP_K
+    assert extra["bm25_top_n"] == 20
+    assert extra["chroma_top_n"] == 20
     assert "overlap" in extra
     assert "filter_sections" in extra
+
+
+def test_hybrid_branch_widths_are_configurable():
+    s = HybridStrategy(bm25_top_k=8, chroma_top_k=12)
+    chroma_data = _fake_chroma_data()
+    with (
+        patch("agent.strategies.hybrid._classify", return_value="general"),
+        patch(
+            "agent.strategies.hybrid._get_bm25_index",
+            return_value=(None, chroma_data["ids"], chroma_data["metadatas"], chroma_data["documents"]),
+        ),
+        patch("agent.strategies.hybrid._bm25_search", return_value=[(0, 1.0)]) as mock_bm25,
+        patch("agent.strategies.hybrid.search", return_value=[]) as mock_search,
+    ):
+        result = s.retrieve("x")
+
+    mock_bm25.assert_called_once_with("x", k=8, allowed_sections=None)
+    mock_search.assert_called_once()
+    assert mock_search.call_args.kwargs["k"] == 12
+    assert result.extra["bm25_top_n"] == 8
+    assert result.extra["chroma_top_n"] == 12
 
 
 def test_hybrid_applies_section_filter_to_both_retrievers():

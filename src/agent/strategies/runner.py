@@ -10,7 +10,7 @@ import asyncio
 import time
 from typing import Any
 
-from agent.nodes.answerer import answer
+from agent.nodes.answerer import answer, stream_answer_async, _format_sources_from_items
 from agent.strategies.base import RetrievedItem, Strategy, StrategyResult
 
 
@@ -95,6 +95,40 @@ def get_all_strategies() -> list[Strategy]:
 _STRATEGIES_SINGLETON: list[Strategy] | None = None
 
 
+def get_extra_strategies() -> list[Strategy]:
+    """Strategies fuera del comparador default (ej: rerank_ce, lexical)."""
+    global _EXTRA_STRATEGIES_SINGLETON
+    if _EXTRA_STRATEGIES_SINGLETON is None:
+        from agent.strategies.lexical import LexicalStrategy
+        from agent.strategies.rerank_ce import RerankCEStrategy
+
+        _EXTRA_STRATEGIES_SINGLETON = [RerankCEStrategy(), LexicalStrategy()]
+    return _EXTRA_STRATEGIES_SINGLETON
+
+
+_EXTRA_STRATEGIES_SINGLETON: list[Strategy] | None = None
+
+
+def get_strategies_by_names(names: list[str], **hybrid_kwargs) -> list[Strategy]:
+    """Busca strategies (default + extra) por nombre, respetando el orden.
+
+    Si hybrid_kwargs no esta vacio, el hybrid se construye nuevo con esos
+    parametros (anchos de rama BM25/semantica) en vez del singleton.
+    """
+    by_name = {s.name: s for s in get_all_strategies() + get_extra_strategies()}
+    out: list[Strategy] = []
+    for n in names:
+        if n not in by_name:
+            continue
+        if n == "hybrid" and hybrid_kwargs:
+            from agent.strategies.hybrid import HybridStrategy
+
+            out.append(HybridStrategy(**hybrid_kwargs))
+        else:
+            out.append(by_name[n])
+    return out
+
+
 # ---------- Async runner ----------
 
 async def _run_one(
@@ -160,6 +194,7 @@ async def _run_one(
                 "aux_llm_input_tokens": result.llm_input_tokens,
                 "aux_llm_output_tokens": result.llm_output_tokens,
                 "extra": result.extra,
+                "trace": result.trace_to_dict(),
             },
         )
 
@@ -188,6 +223,8 @@ async def _run_one(
         "intent": intent,
         # Extra metadata de la strategy
         "extra": result.extra,
+        # Trace paso a paso del retrieve
+        "trace": result.trace_to_dict(),
     }
 
     # Propagar error de la strategy (si el retrieve fallo pero devolvio
@@ -212,14 +249,7 @@ async def run_compare(
     k: int = 6,
     strategies: list[Strategy] | None = None,
 ) -> ComparisonResponse:
-    """Corre todas las strategies en paralelo y devuelve el comparison completo.
-
-    Args:
-        question: la pregunta del productor
-        history: lista opcional de {role, content} (para query_rewrite)
-        k: cuantos chunks recuperar por strategy
-        strategies: lista opcional (default: las 6 del comparador)
-    """
+    """Corre todas las strategies en paralelo y devuelve el comparison completo."""
     if strategies is None:
         strategies = get_all_strategies()
 
@@ -230,3 +260,103 @@ async def run_compare(
         question=question,
         strategies={r.name: r for r in results},
     )
+
+
+# ---------------------------------------------------------------------------
+# Streaming compare: corre N strategies en paralelo y emite eventos SSE
+# ---------------------------------------------------------------------------
+
+async def _run_one_stream(
+    strategy: Strategy,
+    question: str,
+    history: list[dict] | None,
+    k: int,
+    queue: asyncio.Queue,
+    temperature: float | None = None,
+):
+    """Corre UNA strategy con streaming y mete los eventos en la queue."""
+    try:
+        # 1) Retrieve (sync, va en un thread)
+        t0 = time.time()
+        result = await asyncio.to_thread(strategy.retrieve, question, history, k)
+        retrieval_ms = (time.time() - t0) * 1000
+        items = result.items
+        intent = result.intent
+
+        sources = _format_sources_from_items(items)
+        await queue.put({
+            "strategy": strategy.name,
+            "type": "retrieve_done",
+            "data": {
+                "intent": intent,
+                "sources": sources,
+                "num_sources": result.num_sources,
+                "distinct_sources": result.distinct_sources,
+                "retrieval_ms": round(retrieval_ms, 2),
+                "aux_llm_input_tokens": result.llm_input_tokens,
+                "aux_llm_output_tokens": result.llm_output_tokens,
+                "extra": result.extra,
+                "trace": result.trace_to_dict(),
+            },
+        })
+
+        # 2) Answerer streaming (async)
+        t_answer = time.time()
+        token_gen, usage = await stream_answer_async(question, items, temperature)
+        full_text = ""
+        async for token in token_gen:
+            full_text += token
+            await queue.put({
+                "strategy": strategy.name,
+                "type": "token",
+                "data": token,
+            })
+        answerer_ms = (time.time() - t_answer) * 1000
+
+        await queue.put({
+            "strategy": strategy.name,
+            "type": "done",
+            "data": {
+                "answer": full_text,
+                "sources": sources,
+                "answerer_ms": round(answerer_ms, 2),
+                "input_tokens": usage["input_tokens"],
+                "output_tokens": usage["output_tokens"],
+                "items": [item_to_dict(i) for i in items],
+            },
+        })
+    except Exception as e:
+        await queue.put({
+            "strategy": strategy.name,
+            "type": "error",
+            "data": str(e),
+        })
+
+
+async def run_compare_stream(
+    question: str,
+    history: list[dict] | None = None,
+    k: int = 6,
+    strategies: list[Strategy] | None = None,
+    temperature: float | None = None,
+):
+    """Async generator: corre las strategies en paralelo y yield eventos.
+
+    Cada evento es un dict:
+        {"strategy": ..., "type": "retrieve_done"|"token"|"done"|"error", "data": ...}
+    """
+    if strategies is None:
+        strategies = get_all_strategies()
+
+    queue: asyncio.Queue = asyncio.Queue()
+    total = len(strategies)
+
+    for s in strategies:
+        asyncio.create_task(_run_one_stream(s, question, history, k, queue, temperature))
+
+    finished = 0
+    while finished < total:
+        msg = await queue.get()
+        yield msg
+        if msg["type"] in ("done", "error"):
+            finished += 1

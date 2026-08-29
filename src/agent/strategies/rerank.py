@@ -1,4 +1,4 @@
-"""Strategy 3: rerank con LLM (gpt-4.1-nano).
+"""Strategy 3: rerank con LLM (gpt-4.1-nano por default, configurable).
 
 Pasos:
 1. Recupera top-N del chroma (semantico, con filtro por intent).
@@ -19,9 +19,10 @@ import time
 
 from openai import OpenAI
 
+from agent.llm import get_chat_client, llm_model, seed_for_temperature
 from agent.nodes.classifier import _classify
 from agent.nodes.retriever import INTENT_TO_SECTION
-from agent.strategies.base import RetrievedItem, Strategy, StrategyResult
+from agent.strategies.base import RetrievedItem, Strategy, StrategyResult, TraceRecorder
 from agent.strategies.llm_retry import call_with_retry
 from ingestion.indexer import search
 
@@ -107,13 +108,13 @@ class RerankStrategy(Strategy):
 
     def __init__(
         self,
-        model: str = DEFAULT_MODEL,
+        model: str | None = None,
         top_n: int = DEFAULT_RETRIEVE_TOP_N,
         client: OpenAI | None = None,
     ):
-        self.model = model
+        self.model = model or llm_model()
         self.top_n = top_n
-        self.client = client or OpenAI()
+        self.client = client or get_chat_client()
 
     def retrieve(
         self,
@@ -121,19 +122,23 @@ class RerankStrategy(Strategy):
         history: list[dict] | None = None,
         k: int = DEFAULT_RERANK_TOP_K,
     ) -> StrategyResult:
+        tr = TraceRecorder()
         intent = _classify(question)
         allowed = INTENT_TO_SECTION.get(intent)
-
-        t0 = time.time()
+        filtro = f", filtro={allowed}" if allowed else ", sin filtro de seccion"
+        tr.step("classify", f"intent={intent}{filtro}", at_t=time.monotonic())
 
         # 1) Retrieve top-N from chroma
+        timings: dict = {}
+        t_search = time.monotonic()
         if allowed is None:
-            chroma_hits = search(question, k=self.top_n)
+            chroma_hits = search(question, k=self.top_n, timings=timings)
         else:
             chroma_hits = search(
                 question,
                 k=self.top_n,
                 where={"seccion": {"$in": allowed}},
+                timings=timings,
             )
         candidates = [
             RetrievedItem(
@@ -149,13 +154,26 @@ class RerankStrategy(Strategy):
             )
             for rank, (chunk, score) in enumerate(chroma_hits)
         ]
+        embed_ms = timings.get("embed_ms", 0) / 1000
+        chroma_ms = timings.get("chroma_ms", 0) / 1000
+        tr.step(
+            "embed_query",
+            f"model={timings.get('embed_model', '?')}, dims={timings.get('embed_dims', '?')}",
+            at_t=t_search + embed_ms,
+        )
+        tr.step(
+            "chroma_search",
+            f"top-{self.top_n}, hits={len(chroma_hits)}",
+            at_t=t_search + embed_ms + chroma_ms,
+        )
 
         if not candidates:
             return StrategyResult(
                 name=self.name,
                 items=[],
                 intent=intent,
-                retrieval_ms=(time.time() - t0) * 1000,
+                retrieval_ms=tr.steps[-1].acc_ms if tr.steps else 0.0,
+                trace=tr.steps,
             )
 
         # 2) LLM rerank
@@ -177,6 +195,7 @@ class RerankStrategy(Strategy):
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=MAX_TOKENS,
                 temperature=TEMPERATURE,
+                seed=seed_for_temperature(TEMPERATURE),
             )
             content = response.choices[0].message.content or ""
             if response.usage:
@@ -187,9 +206,15 @@ class RerankStrategy(Strategy):
                 name=self.name,
                 items=candidates[:k],
                 intent=intent,
-                retrieval_ms=(time.time() - t0) * 1000,
+                retrieval_ms=tr.steps[-1].acc_ms if tr.steps else 0.0,
                 extra={"error": f"llm_call_failed: {e}"},
+                trace=tr.steps,
             )
+        tr.step(
+            "llm_rerank",
+            f"k={k}, n={len(candidates)}, model={self.model}",
+            at_t=time.monotonic(),
+        )
 
         # 3) Parse indices
         indices = _parse_indices(content, len(candidates))
@@ -212,7 +237,12 @@ class RerankStrategy(Strategy):
             item.rank = rank
             item.score = 1.0 / (rank + 1)
 
-        elapsed_ms = (time.time() - t0) * 1000
+        tr.step(
+            "build_ranking",
+            f"k={k}, indices={len(indices)}, fallback={fallback}",
+            at_t=time.monotonic(),
+        )
+        elapsed_ms = tr.steps[-1].acc_ms if tr.steps else 0.0
 
         return StrategyResult(
             name=self.name,
@@ -230,4 +260,5 @@ class RerankStrategy(Strategy):
                 "fallback": fallback,
                 "filter_sections": allowed,
             },
+            trace=tr.steps,
         )

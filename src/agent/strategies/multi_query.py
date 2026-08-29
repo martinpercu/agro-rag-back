@@ -14,11 +14,10 @@ import json
 import re
 import time
 
-from openai import OpenAI
-
+from agent.llm import get_chat_client, llm_model
 from agent.nodes.classifier import _classify
 from agent.nodes.retriever import INTENT_TO_SECTION
-from agent.strategies.base import RetrievedItem, Strategy, StrategyResult
+from agent.strategies.base import RetrievedItem, Strategy, StrategyResult, TraceRecorder
 from agent.strategies.llm_retry import call_with_retry
 from ingestion.indexer import search
 
@@ -92,10 +91,10 @@ def _rrf_merge(rankings: list[list[str]], k: int = _RRF_K) -> list[tuple[str, fl
 class MultiQueryStrategy(Strategy):
     name = "multi_query"
 
-    def __init__(self, model: str = DEFAULT_MODEL, n_queries: int = DEFAULT_N_QUERIES):
-        self.model = model
+    def __init__(self, model: str | None = None, n_queries: int = DEFAULT_N_QUERIES):
+        self.model = model or llm_model()
         self.n_queries = n_queries
-        self.client = OpenAI()
+        self.client = get_chat_client()
 
     def retrieve(
         self,
@@ -103,13 +102,15 @@ class MultiQueryStrategy(Strategy):
         history: list[dict] | None = None,
         k: int = DEFAULT_K,
     ) -> StrategyResult:
-        t0 = time.time()
+        tr = TraceRecorder()
 
         # 1) Clasificamos el intent UNA vez sobre la pregunta original
         # y lo aplicamos a las N sub-queries (consistente con el resto
         # de las strategies)
         intent = _classify(question)
         allowed = INTENT_TO_SECTION.get(intent)
+        filtro = f", filtro={allowed}" if allowed else ", sin filtro de seccion"
+        tr.step("classify", f"intent={intent}{filtro}", at_t=time.monotonic())
 
         # 2) LLM genera N reformulaciones
         gen_in_tok = 0
@@ -152,21 +153,50 @@ class MultiQueryStrategy(Strategy):
             fallback = "partial_rewrites"
         else:
             fallback = None
+        tr.step(
+            "llm_generate",
+            f"n={len(generated)}, fallback={fallback}, model={self.model}",
+            at_t=time.monotonic(),
+        )
 
         # 3) Retrieval para cada sub-query
         rankings: list[list[str]] = []
         per_query_hits: dict[str, list[tuple]] = {}
-        for q in generated:
+        for i, q in enumerate(generated):
+            timings: dict = {}
+            t_search = time.monotonic()
             if allowed is None:
-                hits = search(q, k=_CHROMA_TOP_K)
+                hits = search(q, k=_CHROMA_TOP_K, timings=timings)
             else:
-                hits = search(q, k=_CHROMA_TOP_K, where={"seccion": {"$in": allowed}})
+                hits = search(
+                    q,
+                    k=_CHROMA_TOP_K,
+                    where={"seccion": {"$in": allowed}},
+                    timings=timings,
+                )
             rk = [chunk.id for chunk, _ in hits]
             rankings.append(rk)
             per_query_hits[q] = hits
+            embed_ms = timings.get("embed_ms", 0) / 1000
+            chroma_ms = timings.get("chroma_ms", 0) / 1000
+            tr.step(
+                f"embed_query_{i + 1}",
+                f"model={timings.get('embed_model', '?')}, dims={timings.get('embed_dims', '?')}",
+                at_t=t_search + embed_ms,
+            )
+            tr.step(
+                f"chroma_search_{i + 1}",
+                f"top-{_CHROMA_TOP_K}, hits={len(hits)}",
+                at_t=t_search + embed_ms + chroma_ms,
+            )
 
         # 4) RRF merge
         merged = _rrf_merge(rankings, k=_RRF_K)
+        tr.step(
+            "rrf_merge",
+            f"k={_RRF_K}, rankings={len(rankings)}",
+            at_t=time.monotonic(),
+        )
 
         # 5) Map a RetrievedItem. Necesitamos el chunk completo, lo
         # buscamos en cualquiera de los rankings (todos apuntan al chroma)
@@ -197,7 +227,7 @@ class MultiQueryStrategy(Strategy):
                 )
             )
 
-        elapsed_ms = (time.time() - t0) * 1000
+        elapsed_ms = tr.steps[-1].acc_ms if tr.steps else 0.0
 
         # Total tokens (generator + los embeddings de cada sub-query,
         # que chroma hace internamente). Solo contamos los del generator.
@@ -218,4 +248,5 @@ class MultiQueryStrategy(Strategy):
                 "llm_error": llm_error,
                 "filter_sections": allowed,
             },
+            trace=tr.steps,
         )
