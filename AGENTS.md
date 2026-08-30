@@ -1,4 +1,4 @@
-# CLAUDE.md (backend)
+# AGENTS.md (backend)
 
 ## Que es este repo
 

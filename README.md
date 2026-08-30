@@ -14,14 +14,14 @@ Backend de Agroposta: agente conversacional en rioplatense que responde pregunta
 ## Estructura
 
 ```
-agro-back/
+agro-rag-back/
 ├── src/
 │   ├── agent/                LangGraph + las 6 strategies del comparador
 │   │   ├── graph.py
 │   │   ├── state.py
 │   │   ├── nodes/            classifier, retriever, answerer
 │   │   └── strategies/       6 strategies + runner async
-│   ├── ingestion/            extractor (pdfplumber), chunker, indexer
+│   ├── ingestion/            extractor (pdfplumber), chunker, indexer (+ vector_store.py Chroma/Pinecone)
 │   ├── export/               pdf_generator (fpdf2)
 │   ├── api/                  FastAPI app
 │   └── schemas.py            Pydantic models
@@ -31,6 +31,8 @@ agro-back/
 │   ├── raw/                  PDFs fuente (ej margenes_2026_05.pdf)
 │   └── vector/               ChromaDB (gitignored, regenerable)
 ├── pyproject.toml
+├── Dockerfile
+├── railway.json
 └── uv.lock
 ```
 
@@ -84,6 +86,6 @@ uv run pytest tests/ --integration
 
 El answerer es el MISMO para las 6 (system prompt rioplatense, gpt-4.1-nano). Solo cambia el retrieval.
 
-## Ver el CLAUDE.md
+## Ver el AGENTS.md
 
-`cat CLAUDE.md` para contexto adicional sobre el proyecto.
+`cat AGENTS.md` para contexto adicional sobre el proyecto.
