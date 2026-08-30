@@ -55,7 +55,11 @@ _bm25_cache: dict[str, tuple] = {}
 
 
 def _get_bm25_index():
-    """Devuelve (bm25, ids, metas, docs) y reconstruye si la coleccion cambio."""
+    """Devuelve (bm25, ids, metas, docs) y reconstruye si la coleccion cambio.
+
+    Si la coleccion esta vacia, devuelve bm25=None para que el search
+    devuelva ranking vacio sin division por cero (corpus_size==0).
+    """
     col = get_collection()
     current_count = col.count()
     col_name = col.name
@@ -65,6 +69,9 @@ def _get_bm25_index():
         docs = data.get("documents") or []
         metas = data.get("metadatas") or []
         ids = data.get("ids") or []
+        if not docs or current_count == 0:
+            _bm25_cache[key] = (None, ids, metas, docs)
+            return _bm25_cache[key]
         tokenized_corpus = [_tokenize(d) for d in docs]
         bm25 = BM25Okapi(tokenized_corpus)
         _bm25_cache[key] = (bm25, ids, metas, docs)
@@ -74,6 +81,8 @@ def _get_bm25_index():
 def _bm25_search(query: str, k: int, allowed_sections: list[str] | None) -> list[tuple[int, float]]:
     """Top-k de BM25. Si allowed_sections, filtra por seccion."""
     bm25, _, metas, _ = _get_bm25_index()
+    if bm25 is None:
+        return []
     tokens = _tokenize(query)
     if not tokens:
         return []
@@ -162,27 +171,50 @@ class HybridStrategy(Strategy):
 
         elapsed_ms = tr.steps[-1].acc_ms if tr.steps else 0.0
 
-        # 4) Top-k final
+        # 4) Top-k final — mapea RRF ids a RetrievedItem.
+        # Soporta ambos stores: si el id viene de Pinecone (via search delegation)
+        # y no esta en el cache BM25 (chroma vacio), fallback a chroma_hits map.
+        chroma_map: dict[str, tuple] = {}
+        for chunk, _ in chroma_hits:
+            chroma_map[chunk.id] = chunk
+
         items = []
         for rank, (cid, rrf_score) in enumerate(merged[:k]):
             try:
                 idx = ids.index(cid)
-            except ValueError:
-                continue
-            meta = metas[idx]
-            items.append(
-                RetrievedItem(
-                    chunk_id=cid,
-                    text=docs[idx],
-                    seccion=meta.get("seccion"),
-                    pagina=meta.get("pagina"),
-                    cultivo=meta.get("cultivo"),
-                    campana=meta.get("campana"),
-                    tipo=meta.get("tipo"),
-                    score=float(rrf_score),
-                    rank=rank,
+                meta = metas[idx]
+                items.append(
+                    RetrievedItem(
+                        chunk_id=cid,
+                        text=docs[idx],
+                        seccion=meta.get("seccion"),
+                        pagina=meta.get("pagina"),
+                        cultivo=meta.get("cultivo"),
+                        campana=meta.get("campana"),
+                        tipo=meta.get("tipo"),
+                        score=float(rrf_score),
+                        rank=rank,
+                    )
                 )
-            )
+                continue
+            except ValueError:
+                pass
+            # Fallback: viene de Pinecone semantic path (search delegation)
+            chunk = chroma_map.get(cid)
+            if chunk is not None:
+                items.append(
+                    RetrievedItem(
+                        chunk_id=chunk.id,
+                        text=chunk.text,
+                        seccion=chunk.metadata.seccion,
+                        pagina=chunk.metadata.pagina,
+                        cultivo=chunk.metadata.cultivo,
+                        campana=chunk.metadata.campana,
+                        tipo=chunk.metadata.tipo,
+                        score=float(rrf_score),
+                        rank=rank,
+                    )
+                )
 
         overlap = len(set(bm25_ranking) & set(chroma_ranking))
 

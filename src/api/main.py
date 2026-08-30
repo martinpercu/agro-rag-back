@@ -24,11 +24,11 @@ from agent.strategies.runner import (
     run_compare,
     run_compare_stream,
 )
-from ingestion.indexer import collection_stats
+from ingestion.vector_store import get_vector_store, vector_store_name
 
 load_dotenv()
 
-ALLOWED_ORIGINS = os.getenv("AGROPOSTA_ALLOWED_ORIGINS", "http://localhost:3002").split(",")
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("AGROPOSTA_ALLOWED_ORIGINS", "http://localhost:3002").split(",") if o.strip()]
 EDITION = os.getenv("AGROPOSTA_EDITION", "2026_05")
 
 app = FastAPI(title="Agroposta API", version="0.1.0")
@@ -70,12 +70,16 @@ class CompareStreamRequest(BaseModel):
 
 @app.get("/")
 def health() -> dict:
-    return {"status": "ok", "service": "agroposta", "edition": EDITION}
+    vs = get_vector_store()
+    return {"status": "ok", "service": "agroposta", "edition": EDITION, "vector_store": vector_store_name(), "vector_health": vs.health()}
 
 
 @app.get("/stats")
 def stats() -> dict:
-    return collection_stats()
+    vs = get_vector_store()
+    base = vs.collection_stats()
+    base["vector_store"] = vector_store_name()
+    return base
 
 
 # --------------------------------------------------------------------

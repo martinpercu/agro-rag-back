@@ -76,7 +76,18 @@ def index_chunks(
 
     Si el chunk ya existe (mismo id), lo saltea. Asi correr dos veces
     el script no duplica.
+
+    Delega a PineconeStore si VECTOR_STORE=pinecone.
     """
+    try:
+        from ingestion.vector_store import is_pinecone
+
+        if is_pinecone():
+            from ingestion.vector_store import get_vector_store
+
+            return get_vector_store().index_chunks(chunks, batch_size=batch_size)
+    except Exception:
+        pass
     if not chunks:
         return 0
 
@@ -116,7 +127,24 @@ def search(
     pre-computado. Si se pasan ambos o ninguno, error.
     Si `timings` es un dict, lo llena con {"embed_ms", "chroma_ms",
     "embed_model"} para el trace de las strategies.
+
+    Switch VECTOR_STORE: si es pinecone, delega a PineconeStore (mantiene
+    compat con strategies que importan desde indexer).
     """
+    # Switch vector store — permite ver todos los sistemas independientemente
+    # sin tocar las strategies (que importan desde este modulo).
+    try:
+        from ingestion.vector_store import is_pinecone
+
+        if is_pinecone():
+            from ingestion.vector_store import get_vector_store
+
+            return get_vector_store().search(
+                query=query, k=k, where=where, query_vector=query_vector, timings=timings
+            )
+    except Exception:
+        # Si pinecone no esta instalado/configurado, fallback a Chroma
+        pass
     if (query is None) == (query_vector is None):
         raise ValueError("search: pasar exactamente uno de `query` o `query_vector`")
     embeddings_fn = get_embeddings()
@@ -155,7 +183,16 @@ def search(
 
 
 def collection_stats(base: Path | None = None) -> dict:
-    """Metricas basicas del vector store."""
+    """Metricas basicas del vector store (delega a Pinecone si VECTOR_STORE=pinecone)."""
+    try:
+        from ingestion.vector_store import is_pinecone
+
+        if is_pinecone():
+            from ingestion.vector_store import get_vector_store
+
+            return get_vector_store().collection_stats()
+    except Exception:
+        pass
     collection = get_collection(base)
     with _ops_lock:
         count = collection.count()

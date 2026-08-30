@@ -21,6 +21,7 @@ dependencies = [
     "langgraph>=1.0.0",
     "fpdf2>=2.7",
     "uvicorn>=0.30",
+    "pinecone>=5.0",
 ]
 
 [dependency-groups]

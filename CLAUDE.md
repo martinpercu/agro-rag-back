@@ -4,7 +4,9 @@
 
 Backend de Agroposta: un agente conversacional en rioplatense que responde preguntas sobre la revista "Margenes Agropecuarios" usando RAG (Retrieval-Augmented Generation).
 
-Stack: Python 3.13 + FastAPI + LangGraph + ChromaDB + OpenAI.
+Stack: Python 3.13 + FastAPI + LangGraph + ChromaDB/Pinecone + OpenAI.
+
+**Estado 2026-08-30:** single DB 768 `text-embedding-nomic-embed-text-v1.5` en Chroma local (107 docs, `VECTOR_STORE=chroma`), y `text-embedding-3-small__d768` en Pinecone `agro-vectorstore` 768 cosine serverless (107 docs, `VECTOR_STORE=pinecone`). Ver `agroposta-plans/README.md` para plan 2 fases.
 
 ## Stack local vs OpenAI (provider factory)
 
@@ -15,12 +17,17 @@ Todos los clientes se crean via `src/agent/llm.py`, que lee env vars:
 | `AGROPOSTA_LLM_BASE_URL` | (vacío → OpenAI) | Base URL del chat LLM (ej: LM Studio `http://192.168.12.215:1234/v1`) |
 | `AGROPOSTA_LLM_MODEL` | `gpt-4.1-nano` | Modelo del chat (ej: `qwen/qwen3.6-35b-a3b`) |
 | `AGROPOSTA_EMBEDDING_MODEL` | `text-embedding-3-small` | Modelo de embeddings (ej: `text-embedding-nomic-embed-text-v1.5`) |
+| `AGROPOSTA_EMBEDDING_DIMS` | (vacío → native) | Dims Matryoshka para `text-embedding-3-small` (ej: `768`) |
 | `AGROPOSTA_RERANK_URL` | `http://192.168.12.215:8001/v1/rerank` | Servicio de cross-encoder rerank (Jina-compatible) |
 | `OPENAI_API_KEY` | — | Key. Con un servidor local cualquiera sirve (ej: `lm-studio`) |
+| `VECTOR_STORE` | `chroma` | `chroma` (local file `data/vector/`) o `pinecone` (serverless) |
+| `PINECONE_API_KEY` / `PINECONE_INDEX` | — | Solo si `VECTOR_STORE=pinecone` |
 
-- `collection_name()` deriva el nombre de la coleccion ChromaDB del embedding model: el default conserva `margenes_agropecuarios` (store existente), el resto → `margenes_agropecuarios__<modelo>`.
+- `collection_name()` deriva el nombre de la coleccion del embedding model + dims: default sin dims conserva `margenes_agropecuarios` (1536), con `AGROPOSTA_EMBEDDING_DIMS=768` → `margenes_agropecuarios__d768`. Otros modelos → `margenes_agropecuarios__<modelo>`.
 - **No usar `langchain_openai.OpenAIEmbeddings`**: tokeniza y manda token IDs, que LM Studio rechaza. Usar `get_embeddings()` (adapter propio sobre el SDK).
 - El profile local esta en `.env.local` (cargar con `set -a; source .env.local; set +a`; `load_dotenv` solo lee `.env`).
+- **Switch local:on/off**: `source .env.local` (local LLM `qwen` + bge-m3 + `VECTOR_STORE=chroma`) vs `source .env` (OpenAI `gpt-4.1-nano` + `text-embedding-3-small__d768` + `VECTOR_STORE=chroma|pinecone`). Ver `GET /` → `vector_store` + `vector_health` para verificar.
+- **VectorStore abstraction** en `src/ingestion/vector_store.py`: `VECTOR_STORE=chroma` delega a `indexer.py` (Chroma file), `pinecone` delega a Pinecone Serverless (768d `cosine`, free tier). Las strategies importan `indexer.search` que ya delega automaticamente.
 
 ## Estructura clave
 
@@ -32,13 +39,21 @@ Todos los clientes se crean via `src/agent/llm.py`, que lee env vars:
 - `src/agent/nodes/answerer.py`: el system prompt rioplatense (gpt-4.1-nano)
 - `tests/`: unit + integration tests, golden questions en `tests/golden_questions.json` y `tests/golden_compare_questions.json`
 
-## Comandos utiles
+## Comandos utiles — switch local:on/off + vectorstore
 
 ```bash
-# Levantar el backend
+# Local single DB 768 (nomic via LM Studio + rerank :8001)
+set -a; source .env.local; set +a  # VECTOR_STORE=chroma, nomic 768
 uv run uvicorn api.main:app --host 127.0.0.1 --port 8002 --app-dir src
+curl http://127.0.0.1:8002/ | jq .vector_health  # → chroma nomic 768
 
-# Ingestar un PDF (una vez)
+# Prod Pinecone 768 (OpenAI, sin Mac mini)
+set -a; source .env; set +a  # VECTOR_STORE=pinecone, PINECONE_INDEX=agro-vectorstore, DIMS=768
+uv run uvicorn api.main:app --host 127.0.0.1 --port 8002 --app-dir src
+curl http://127.0.0.1:8002/ | jq .vector_health  # → pinecone agro-vectorstore 768
+curl http://127.0.0.1:8002/stats | jq .total       # → 107
+
+# Ingestar un PDF (una vez) — respeta VECTOR_STORE
 uv run python scripts/ingest_magazine.py data/raw/<archivo>.pdf
 
 # Tests
