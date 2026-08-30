@@ -22,6 +22,13 @@ dependencies = [
     "fpdf2>=2.7",
     "uvicorn>=0.30",
     "pinecone>=5.0",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.1",
+    "asyncpg>=0.29",
+    "pyjwt>=2.8",
+    "httpx>=0.28.1",
+    "psycopg2-binary>=2.9",
 ]
 
 [dependency-groups]

@@ -12,7 +12,7 @@ import json
 import os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -42,6 +42,15 @@ app.add_middleware(
 )
 
 
+def _get_db_url() -> str:
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url:
+        return ""
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
+
+
 # --------------------------------------------------------------------
 # Modelos
 # --------------------------------------------------------------------
@@ -62,6 +71,28 @@ class CompareStreamRequest(BaseModel):
     sem_bm25: int | None = Field(default=None, ge=1, le=40)  # ancho rama semantica de hybrid
     lex_bm25: int | None = Field(default=None, ge=1, le=40)  # ancho rama BM25 de hybrid
     temperature: float | None = Field(default=None, ge=0, le=1)  # temperatura del answerer
+
+
+class InvestigationCreate(BaseModel):
+    query: str | None = None
+    edition_id: str | None = None
+    divisions: list[dict] | None = None
+    location: dict | None = None
+    price_variants: list[float] | None = None
+    client_hint: str | None = None
+    metadata: dict | None = None
+
+
+class PlanCreate(BaseModel):
+    investigation_id: str | None = None
+    edition_id: str | None = None
+    total_hectares: str | None = None
+    season: str | None = None
+    divisions: list[dict] | None = None
+    location: dict | None = None
+    price_variants: list[float] | None = None
+    client_hint: str | None = None
+    metadata: dict | None = None
 
 
 # --------------------------------------------------------------------
@@ -160,6 +191,208 @@ async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
                 yield f"event: strategy_error\ndata: {json.dumps({'strategy': name, 'error': data})}\n\n"
 
     return StreamingResponse(_format_events(), media_type="text/event-stream")
+
+
+# --------------------------------------------------------------------
+# Auth + DB — Fase 0 (Supabase JWT + Railway Postgres)
+# --------------------------------------------------------------------
+
+def _ensure_user(db, payload: dict) -> dict:
+    """Get or create user from Supabase payload. Returns DB user dict."""
+    import uuid
+
+    from db.models import User
+
+    supa_id = payload.get("sub")
+    email = payload.get("email") or payload.get("user_metadata", {}).get("email") if isinstance(payload.get("user_metadata"), dict) else payload.get("email")
+    if not supa_id:
+        raise HTTPException(status_code=401, detail="Token missing sub")
+    try:
+        uid = uuid.UUID(supa_id)
+    except Exception:
+        # Supabase sub may be uuid string
+        uid = uuid.uuid5(uuid.NAMESPACE_DNS, str(supa_id))
+        # Use deterministic but store original string in supabase_user_id if not uuid
+        # For now try to parse, if fails create with random
+        try:
+            uid = uuid.UUID(supa_id)
+        except Exception:
+            uid = uuid.uuid4()
+
+    # Try to find by supabase_user_id
+    # Handle both uuid and string sub
+    user = None
+    try:
+        user = db.query(User).filter(User.supabase_user_id == uid).first()
+    except Exception:
+        user = None
+    if not user and supa_id:
+        # Try string search via casting
+        try:
+            user = db.query(User).filter(User.supabase_user_id == supa_id).first()  # type: ignore
+        except Exception:
+            pass
+    if user:
+        return {"id": str(user.id), "supabase_user_id": str(user.supabase_user_id), "email": user.email, "role": user.role, "allow_aggregated_use": user.allow_aggregated_use}
+
+    # Create
+    new_user = User(supabase_user_id=uid, email=email or f"{supa_id}@unknown", role="user", profile_hints={}, allow_aggregated_use=False)
+    db.add(new_user)
+    try:
+        db.commit()
+        db.refresh(new_user)
+    except Exception as e:
+        db.rollback()
+        # Race: try fetch again
+        user = db.query(User).filter(User.supabase_user_id == uid).first()
+        if user:
+            return {"id": str(user.id), "supabase_user_id": str(user.supabase_user_id), "email": user.email, "role": user.role, "allow_aggregated_use": user.allow_aggregated_use}
+        raise HTTPException(status_code=500, detail=f"User create failed: {e}")
+    return {"id": str(new_user.id), "supabase_user_id": str(new_user.supabase_user_id), "email": new_user.email, "role": new_user.role, "allow_aggregated_use": new_user.allow_aggregated_use}
+
+
+@app.get("/me")
+async def me(request: Request):
+    """Current user profile (requires Bearer). Returns user + stats."""
+    from api.auth import get_current_user
+
+    payload = await get_current_user(request)
+    # Lazy DB import to avoid circular
+    from sqlalchemy.orm import Session as SASession
+
+    # get_db manually
+    from db.session import get_db as _get_db
+    from db.models import Investigation, Plan, Session as DBSession
+
+    gen = _get_db()
+    db_sess = next(gen)
+    try:
+        user = _ensure_user(db_sess, payload)
+        # Counts
+        inv_count = db_sess.query(Investigation).filter(Investigation.user_id == user["id"]).count()
+        plan_count = db_sess.query(Plan).filter(Plan.user_id == user["id"]).count()
+        sess_count = db_sess.query(DBSession).filter(DBSession.user_id == user["id"]).count()
+        return {"user": user, "payload": {"sub": payload.get("sub"), "email": payload.get("email")}, "counts": {"investigations": inv_count, "plans": plan_count, "sessions": sess_count}}
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+
+@app.get("/investigations")
+async def list_investigations(request: Request):
+    from api.auth import get_current_user
+    from db.session import get_db as _get_db
+    from db.models import Investigation
+
+    payload = await get_current_user(request)
+    gen = _get_db()
+    db = next(gen)
+    try:
+        user = _ensure_user(db, payload)
+        rows = db.query(Investigation).filter(Investigation.user_id == user["id"]).order_by(Investigation.created_at.desc()).limit(50).all()
+        return {"investigations": [{"id": str(r.id), "query": r.query, "edition_id": r.edition_id, "divisions": r.divisions, "location": r.location, "price_variants": r.price_variants, "client_hint": r.client_hint, "metadata": r.meta, "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]}
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+
+@app.post("/investigations")
+async def create_investigation(body: InvestigationCreate, request: Request):
+    from api.auth import get_current_user
+    from db.session import get_db as _get_db
+    from db.models import Investigation
+
+    payload = await get_current_user(request)
+    gen = _get_db()
+    db = next(gen)
+    try:
+        user = _ensure_user(db, payload)
+        inv = Investigation(
+            user_id=user["id"],
+            edition_id=body.edition_id or EDITION,
+            query=body.query,
+            divisions=body.divisions or [],
+            location=body.location or {},
+            price_variants=body.price_variants or [],
+            client_hint=body.client_hint,
+            meta=body.metadata or {},
+        )
+        db.add(inv)
+        db.commit()
+        db.refresh(inv)
+        return {"id": str(inv.id), "created_at": inv.created_at.isoformat() if inv.created_at else None}
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+
+@app.get("/plans")
+async def list_plans(request: Request):
+    from api.auth import get_current_user
+    from db.session import get_db as _get_db
+    from db.models import Plan
+
+    payload = await get_current_user(request)
+    gen = _get_db()
+    db = next(gen)
+    try:
+        user = _ensure_user(db, payload)
+        rows = db.query(Plan).filter(Plan.user_id == user["id"]).order_by(Plan.created_at.desc()).limit(50).all()
+        return {"plans": [{"id": str(r.id), "investigation_id": str(r.investigation_id) if r.investigation_id else None, "edition_id": r.edition_id, "total_hectares": r.total_hectares, "season": r.season, "divisions": r.divisions, "location": r.location, "price_variants": r.price_variants, "client_hint": r.client_hint, "metadata": r.meta, "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]}
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+
+@app.post("/plans")
+async def create_plan(body: PlanCreate, request: Request):
+    from api.auth import get_current_user
+    from db.session import get_db as _get_db
+    from db.models import Plan
+
+    payload = await get_current_user(request)
+    gen = _get_db()
+    db = next(gen)
+    try:
+        user = _ensure_user(db, payload)
+        plan = Plan(
+            user_id=user["id"],
+            investigation_id=body.investigation_id,
+            edition_id=body.edition_id or EDITION,
+            total_hectares=body.total_hectares,
+            season=body.season,
+            divisions=body.divisions or [],
+            location=body.location or {},
+            price_variants=body.price_variants or [],
+            client_hint=body.client_hint,
+            meta=body.metadata or {},
+        )
+        db.add(plan)
+        db.commit()
+        db.refresh(plan)
+        return {"id": str(plan.id), "created_at": plan.created_at.isoformat() if plan.created_at else None}
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+
+@app.get("/editions")
+def list_editions() -> dict:
+    """List available Margenes editions (from Pinecone health + DB fallback)."""
+    # For now single edition, but structure ready for multi-edition
+    vs = get_vector_store()
+    health = vs.health()
+    return {"editions": [{"id": EDITION, "vector_health": health}], "current": EDITION}
 
 
 

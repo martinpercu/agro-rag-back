@@ -18,11 +18,13 @@ COPY src/ src/
 COPY scripts/ scripts/
 COPY data/raw/ data/raw/
 COPY README.md ./
+COPY alembic/ alembic/
+COPY alembic.ini ./
 
 EXPOSE 8002
 
-# Railway injects $PORT; fallback 8002 for local docker run
-CMD ["sh", "-c", "uv run uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8002} --app-dir src"]
+# Railway injects $PORT and DATABASE_URL; run migrations then start
+CMD ["sh", "-c", "uv run alembic upgrade head 2>&1 | head -20; uv run uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8002} --app-dir src"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:${PORT:-8002}/ || exit 1
