@@ -89,7 +89,7 @@ uv run uvicorn api.main:app --port 8002 --app-dir src  # VER en http://localhost
 
 ## Workflow de ramas (obligatorio desde 2026-09-03)
 
-Nunca a `main` directo. Baby steps en rama paralela back+front con mismo nombre:
+Nunca a `main` directo. Baby steps en rama independiente por repo:
 
 ```bash
 git checkout -b feat/<nombre> && git push -u origin feat/<nombre>
@@ -98,6 +98,8 @@ git status; git diff; git log --oneline -5
 git add <archivos> && git commit -m "feat: ..." && git push
 # PR → merge a main lo hace martin en GitHub (Railway deploya)
 ```
+
+Las ramas front y back **NO van en paralelo por defecto**. Cada repo maneja su propia rama si el cambio es solo de ese lado. Solo cuando la sesión requiere implementar desde los 2 lados (ej. cambio de API contract) se crean ramas con mismo nombre en ambos y se coordina desde la raíz.
 
 ## Si vas a tocar el comparador
 
