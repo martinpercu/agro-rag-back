@@ -168,7 +168,15 @@ async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
             for name in names:
                 yield f"event: strategy_error\ndata: {json.dumps({'strategy': name, 'error': msg})}\n\n"
 
-        return StreamingResponse(_reject(), media_type="text/event-stream")
+        return StreamingResponse(
+            _reject(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     all_strategies = get_all_strategies()
     hybrid_kwargs: dict = {}
@@ -201,7 +209,15 @@ async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
             elif typ == "error":
                 yield f"event: strategy_error\ndata: {json.dumps({'strategy': name, 'error': data})}\n\n"
 
-    return StreamingResponse(_format_events(), media_type="text/event-stream")
+    return StreamingResponse(
+        _format_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # --------------------------------------------------------------------
