@@ -65,7 +65,18 @@ uv run python scripts/compare_report.py
 
 # Bakeoff de embeddings (golden questions x baseline/hybrid, sin LLM)
 uv run python scripts/embedding_bakeoff.py --models <modelos separados por coma>
+
+# Langfuse local-only (trazas nodos) — no va a prod
+docker compose -f docker-compose.langfuse.yml up -d  # UI http://localhost:3003, DB 5434:5432
+# luego: set -a; source .env.local; set +a  # LANGFUSE_HOST=http://localhost:3003
+uv run uvicorn api.main:app --port 8002 --app-dir src  # VER en http://localhost:3003/project/agroposta-dev
 ```
+
+## Observabilidad — Langfuse local-only (no prod)
+
+- Langfuse solo en local via `docker-compose.langfuse.yml` (UI `3003:3000`, DB `5434:5432`, volumes `pg_data/ch_data` persistencia).
+- Activo solo si `LANGFUSE_HOST=http://localhost:3003` en `.env.local` (no en `.env` → Railway no traza). Instrumentación en `src/instrumentation.py:1` (OTel + openinference langchain/openai).
+- Ver trazas nodos `classifier→plan_intent→field_collector→retriever→answerer` en `http://localhost:3003/project/agroposta-dev`. `POST /plan/parse` y `POST /compare/stream` ya instrumentados.
 
 ## Convenciones
 

@@ -17,6 +17,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+import instrumentation  # noqa: F401  side-effect: OTel → Langfuse local si LANGFUSE_HOST
+
 from agent.nodes.classifier import is_off_topic
 from agent.strategies.runner import (
     get_all_strategies,
