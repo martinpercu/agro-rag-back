@@ -20,13 +20,17 @@ from pydantic import BaseModel, Field
 import instrumentation  # noqa: F401  side-effect: OTel → Langfuse local si LANGFUSE_HOST
 
 try:
-    from langfuse.decorators import observe
-except Exception:  # langfuse no instalado en CI sin .env.local
-    def observe(*_a, **_k):  # type: ignore
-        def deco(f):
-            return f
+    from langfuse import observe  # langfuse 2.80
+except Exception:
+    try:
+        from langfuse.decorators import observe  # langfuse 3
+    except Exception:  # langfuse no instalado en CI
 
-        return deco
+        def observe(*_a, **_k):  # type: ignore
+            def deco(f):
+                return f
+
+            return deco
 
 from agent.nodes.classifier import is_off_topic
 from agent.strategies.runner import (
