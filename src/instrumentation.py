@@ -37,14 +37,23 @@ def setup_instrumentation() -> bool:
         provider = TracerProvider()
         trace.set_tracer_provider(provider)
 
-        # Si hay un OTLP endpoint (Langfuse 3 expone /api/public/otel/v1/traces)
-        # Lo configuramos si el user puso LANGFUSE_OTLP_URL, sino no exportamos
-        otlp_url = os.getenv("LANGFUSE_OTLP_URL", "").strip()
-        if otlp_url:
+        # Langfuse 3 expone OTLP en /api/public/otel/v1/traces — derivar de HOST si no hay OTLP_URL
+        otlp_url = os.getenv("LANGFUSE_OTLP_URL", "").strip() or f"{host.rstrip('/')}/api/public/otel/v1/traces"
+        # Solo configurar exporter si host está y hay keys (evita ruido en dev sin keys)
+        has_keys = bool(os.getenv("LANGFUSE_PUBLIC_KEY", "").strip() and os.getenv("LANGFUSE_SECRET_KEY", "").strip())
+        if has_keys:
             try:
                 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+                import base64
 
-                exporter = OTLPSpanExporter(endpoint=otlp_url)
+                # Langfuse OTel requiere Basic auth pk+sk
+                pk = os.getenv("LANGFUSE_PUBLIC_KEY", "").strip()
+                sk = os.getenv("LANGFUSE_SECRET_KEY", "").strip()
+                auth = base64.b64encode(f"{pk}:{sk}".encode()).decode()
+                exporter = OTLPSpanExporter(
+                    endpoint=otlp_url,
+                    headers={"Authorization": f"Basic {auth}"},
+                )
                 provider.add_span_processor(BatchSpanProcessor(exporter))
             except Exception:
                 pass
