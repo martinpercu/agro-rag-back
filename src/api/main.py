@@ -17,16 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-import instrumentation  # noqa: F401  side-effect: OTel → Langfuse local si LANGFUSE_HOST
+import instrumentation  # noqa: F401  side-effect: OTel → Langfuse local si LANGFUSE_HOST (now no-op, see observability.py)
 
+from observability import get_langfuse as _get_langfuse  # local-only 3003, no OTel
+
+# Keep legacy var for backwards compat (plan_parse still checks it)
 try:
-    from langfuse import Langfuse
-
-    _langfuse_client = Langfuse()
-    # Validar que las keys estén (si no, cliente queda disabled)
-    if not _langfuse_client.auth_check():
-        # auth_check hace GET /api/public/projects, si falla queda disabled pero no rompe
-        pass
+    _langfuse_client = _get_langfuse()
 except Exception:
     _langfuse_client = None
 
@@ -423,30 +420,174 @@ async def create_plan(body: PlanCreate, request: Request):
             pass
 
 
+def _extract_session_id(request: Request | None = None) -> str:
+    """Sin Auth: extrae session_id=user_id (supabase_user_id) del JWT si hay, si no anon.
+
+    - Si Authorization: Bearer <jwt> presente, decodifica sin verificar y toma `sub`.
+    - Si no, retorna "anon" (dev/local). Permite traza visible sin login.
+    """
+    if request is not None:
+        try:
+            auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+            if auth.lower().startswith("bearer "):
+                token = auth[7:].strip()
+                if token:
+                    # Try decode without verify (PyJWT)
+                    try:
+                        import jwt as _jwt
+
+                        payload = _jwt.decode(token, options={"verify_signature": False})
+                        sub = payload.get("sub")
+                        if sub:
+                            return str(sub)
+                    except Exception:
+                        pass
+                    # Fallback: raw token as session_id (truncated)
+                    return token[:64]
+            # Also check x-user-id header for testing
+            x_uid = request.headers.get("x-user-id") or request.headers.get("X-User-Id")
+            if x_uid:
+                return str(x_uid).strip()[:64]
+        except Exception:
+            pass
+    return "anon"
+
+
 @app.post("/plan/parse", response_model=PlanParseResponse)
-def plan_parse(body: PlanParseRequest) -> dict:
+def plan_parse(body: PlanParseRequest, request: Request) -> dict:
     """Parse ligero Fase 2 baby: detecta plan_intent + divisions sin LLM ni DB.
 
     Útil para el front antes de guardar investigada, y para tests.
-    Traza manual a Langfuse si está configurado (local 3003).
+    Traza manual a Langfuse si está configurado (local 3003) con session_id=user_id.
     """
     from agent.nodes.field_collector import extract_divisions
     from agent.nodes.plan_intent import is_plan_intent
 
-    # Traza Langfuse manual (no @observe para no romper FastAPI signature)
-    if _langfuse_client is not None:
+    session_id = _extract_session_id(request)
+    lf = _get_langfuse()
+    if lf is not None:
         try:
-            with _langfuse_client.start_as_current_observation(as_type="span", name="plan_parse", input={"question": body.question}):
-                intent = is_plan_intent(body.question, body.history)
-                divisions = extract_divisions(body.question, body.history)
-                _langfuse_client.update_current_observation(output={"plan_intent": intent, "divisions": divisions})
-                return {"plan_intent": intent, "divisions": divisions, "location": {}}
+            from langfuse import propagate_attributes  # type: ignore
+
+            with propagate_attributes(session_id=session_id, user_id=session_id):
+                with lf.start_as_current_observation(
+                    name="plan_parse",
+                    as_type="span",
+                    input={"question": body.question, "history": body.history},
+                    metadata={"session_id": session_id},
+                ) as _span:
+                    intent = is_plan_intent(body.question, body.history)
+                    divisions = extract_divisions(body.question, body.history)
+                    try:
+                        lf.update_current_span(output={"plan_intent": intent, "divisions": divisions, "location": {}})
+                    except Exception:
+                        pass
+                    # Also demonstrate full graph tracing: if called via graph, child spans will appear
+                    # We keep lightweight (no LLM) but still use observability helper pattern.
+                    # Flush so trace visible inmediatamente en Langfuse UI 3003
+                    try:
+                        lf.flush()
+                    except Exception:
+                        pass
+                    return {"plan_intent": intent, "divisions": divisions, "location": {}}
         except Exception:
             pass
     intent = is_plan_intent(body.question, body.history)
     divisions = extract_divisions(body.question, body.history)
     # location vacío por ahora (DI-5 abierto)
     return {"plan_intent": intent, "divisions": divisions, "location": {}}
+
+
+class GraphRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=1000)
+    history: list[dict] | None = None
+
+
+@app.post("/chat")
+async def chat(req: GraphRequest, request: Request) -> dict:
+    """Chat full graph: classifier→plan_intent→field_collector→retriever→answerer.
+
+    Traza Langfuse 5 nodos con session_id=user_id (supabase_user_id o anon).
+    Sin OTel, solo SDK manual. Usado para verificar grafo completo en 3003.
+    """
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
+
+    session_id = _extract_session_id(request)
+    lf = _get_langfuse()
+
+    # Fast path: with Langfuse trace
+    if lf is not None:
+        try:
+            from langfuse import propagate_attributes  # type: ignore
+
+            with propagate_attributes(session_id=session_id, user_id=session_id):
+                with lf.start_as_current_observation(
+                    name="chat",
+                    as_type="span",
+                    input={"question": req.question, "history": req.history},
+                    metadata={"session_id": session_id},
+                ) as _root:
+                    from agent.graph import graph
+
+                    # Graph sync; run in thread to not block event loop
+                    import asyncio
+
+                    initial_state = {"question": req.question, "history": req.history or []}
+                    # Prefer async ainvoke if available
+                    try:
+                        result = await graph.ainvoke(initial_state)
+                    except Exception:
+                        # Fallback sync
+                        result = await asyncio.to_thread(graph.invoke, initial_state)
+
+                    answer = result.get("answer", "")
+                    sources = result.get("sources", [])
+                    try:
+                        lf.update_current_span(
+                            output={
+                                "answer": answer,
+                                "sources": sources,
+                                "intent": result.get("intent"),
+                                "plan_intent": result.get("plan_intent"),
+                                "divisions": result.get("divisions"),
+                            }
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        lf.flush()
+                    except Exception:
+                        pass
+                    return {
+                        "answer": answer,
+                        "sources": sources,
+                        "intent": result.get("intent"),
+                        "plan_intent": result.get("plan_intent"),
+                        "divisions": result.get("divisions"),
+                        "location": result.get("location"),
+                    }
+        except Exception as e:
+            # If Langfuse tracing fails, fallback to plain graph
+            pass
+
+    # No tracing or fallback
+    from agent.graph import graph
+    import asyncio
+
+    initial_state = {"question": req.question, "history": req.history or []}
+    try:
+        result = await graph.ainvoke(initial_state)
+    except Exception:
+        result = await asyncio.to_thread(graph.invoke, initial_state)
+    return {
+        "answer": result.get("answer", ""),
+        "sources": result.get("sources", []),
+        "intent": result.get("intent"),
+        "plan_intent": result.get("plan_intent"),
+        "divisions": result.get("divisions"),
+        "location": result.get("location"),
+    }
 
 
 @app.get("/editions")
