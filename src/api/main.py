@@ -95,6 +95,17 @@ class PlanCreate(BaseModel):
     metadata: dict | None = None
 
 
+class PlanParseRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=1000)
+    history: list[dict] | None = None
+
+
+class PlanParseResponse(BaseModel):
+    plan_intent: bool
+    divisions: list[dict]
+    location: dict
+
+
 # --------------------------------------------------------------------
 # Endpoints basicos
 # --------------------------------------------------------------------
@@ -381,6 +392,21 @@ async def create_plan(body: PlanCreate, request: Request):
             next(gen)
         except StopIteration:
             pass
+
+
+@app.post("/plan/parse", response_model=PlanParseResponse)
+def plan_parse(body: PlanParseRequest) -> dict:
+    """Parse ligero Fase 2 baby: detecta plan_intent + divisions sin LLM ni DB.
+
+    Útil para el front antes de guardar investigada, y para tests.
+    """
+    from agent.nodes.field_collector import extract_divisions
+    from agent.nodes.plan_intent import is_plan_intent
+
+    intent = is_plan_intent(body.question, body.history)
+    divisions = extract_divisions(body.question, body.history)
+    # location vacío por ahora (DI-5 abierto)
+    return {"plan_intent": intent, "divisions": divisions, "location": {}}
 
 
 @app.get("/editions")
