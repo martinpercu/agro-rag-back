@@ -303,6 +303,27 @@ def _classify(question: str) -> Intent:
 
 def classifier_node(state: AgentState) -> AgentState:
     question = state["question"]
+    history = state.get("history")
+    # Langfuse span (local-only, no-op if disabled)
+    try:
+        from observability import get_langfuse
+
+        lf = get_langfuse()
+        if lf is not None:
+            with lf.start_as_current_observation(
+                name="classifier",
+                as_type="span",
+                input={"question": question, "history": history},
+            ) as _span:
+                intent = _classify(question)
+                state["intent"] = intent
+                try:
+                    lf.update_current_span(output={"intent": intent})
+                except Exception:
+                    pass
+                return state
+    except Exception:
+        pass
     state["intent"] = _classify(question)
     return state
 
