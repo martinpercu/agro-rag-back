@@ -95,6 +95,17 @@ class PlanCreate(BaseModel):
     metadata: dict | None = None
 
 
+class PlanParseRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=1000)
+    history: list[dict] | None = None
+
+
+class PlanParseResponse(BaseModel):
+    plan_intent: bool
+    divisions: list[dict]
+    location: dict
+
+
 # --------------------------------------------------------------------
 # Endpoints basicos
 # --------------------------------------------------------------------
@@ -157,7 +168,15 @@ async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
             for name in names:
                 yield f"event: strategy_error\ndata: {json.dumps({'strategy': name, 'error': msg})}\n\n"
 
-        return StreamingResponse(_reject(), media_type="text/event-stream")
+        return StreamingResponse(
+            _reject(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     all_strategies = get_all_strategies()
     hybrid_kwargs: dict = {}
@@ -190,7 +209,15 @@ async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
             elif typ == "error":
                 yield f"event: strategy_error\ndata: {json.dumps({'strategy': name, 'error': data})}\n\n"
 
-    return StreamingResponse(_format_events(), media_type="text/event-stream")
+    return StreamingResponse(
+        _format_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # --------------------------------------------------------------------
@@ -210,27 +237,24 @@ def _ensure_user(db, payload: dict) -> dict:
     try:
         uid = uuid.UUID(supa_id)
     except Exception:
-        # Supabase sub may be uuid string
+        # Deterministic UUID for non-UUID subs (e.g. dev-user) — keeps same user across requests
         uid = uuid.uuid5(uuid.NAMESPACE_DNS, str(supa_id))
-        # Use deterministic but store original string in supabase_user_id if not uuid
-        # For now try to parse, if fails create with random
-        try:
-            uid = uuid.UUID(supa_id)
-        except Exception:
-            uid = uuid.uuid4()
 
     # Try to find by supabase_user_id
-    # Handle both uuid and string sub
     user = None
     try:
         user = db.query(User).filter(User.supabase_user_id == uid).first()
     except Exception:
+        db.rollback()
         user = None
     if not user and supa_id:
-        # Try string search via casting
+        # Only try string search if supa_id is a valid UUID string to avoid
+        # "invalid input syntax for type uuid" which aborts the transaction
         try:
+            uuid.UUID(str(supa_id))
             user = db.query(User).filter(User.supabase_user_id == supa_id).first()  # type: ignore
         except Exception:
+            db.rollback()
             pass
     if user:
         return {"id": str(user.id), "supabase_user_id": str(user.supabase_user_id), "email": user.email, "role": user.role, "allow_aggregated_use": user.allow_aggregated_use}
@@ -384,6 +408,21 @@ async def create_plan(body: PlanCreate, request: Request):
             next(gen)
         except StopIteration:
             pass
+
+
+@app.post("/plan/parse", response_model=PlanParseResponse)
+def plan_parse(body: PlanParseRequest) -> dict:
+    """Parse ligero Fase 2 baby: detecta plan_intent + divisions sin LLM ni DB.
+
+    Útil para el front antes de guardar investigada, y para tests.
+    """
+    from agent.nodes.field_collector import extract_divisions
+    from agent.nodes.plan_intent import is_plan_intent
+
+    intent = is_plan_intent(body.question, body.history)
+    divisions = extract_divisions(body.question, body.history)
+    # location vacío por ahora (DI-5 abierto)
+    return {"plan_intent": intent, "divisions": divisions, "location": {}}
 
 
 @app.get("/editions")

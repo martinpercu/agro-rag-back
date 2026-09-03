@@ -22,6 +22,10 @@ class AgentState(TypedDict, total=False):
     - retrieved: lista de (Chunk, score) recuperadas del vector store
     - answer: respuesta final generada por el LLM
     - sources: lista de paginas/secciones citadas (para mostrar al productor y para el PDF)
+    - plan_intent: si el productor quiere ayuda para decidir qué plantar (Fase 2 baby)
+    - divisions: potreros detectados [{hectares: str, cultivo: str|None}]
+    - location: ubicación opcional {label?} (Fase 2 abierto, por ahora vacío)
+    - history: historial reciente [{role, content}] para detectar intención sutil
     """
 
     question: str
@@ -29,3 +33,8 @@ class AgentState(TypedDict, total=False):
     retrieved: list[tuple[dict, float]]
     answer: str
     sources: list[dict]
+    # Fase 2 — dueño de tierra, sin cliente/precio por ahora
+    plan_intent: bool
+    divisions: list[dict]
+    location: dict | None
+    history: list[dict]
