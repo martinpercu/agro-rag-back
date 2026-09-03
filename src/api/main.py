@@ -19,6 +19,15 @@ from pydantic import BaseModel, Field
 
 import instrumentation  # noqa: F401  side-effect: OTel → Langfuse local si LANGFUSE_HOST
 
+try:
+    from langfuse.decorators import observe
+except Exception:  # langfuse no instalado en CI sin .env.local
+    def observe(*_a, **_k):  # type: ignore
+        def deco(f):
+            return f
+
+        return deco
+
 from agent.nodes.classifier import is_off_topic
 from agent.strategies.runner import (
     get_all_strategies,
@@ -143,6 +152,7 @@ async def compare(req: CompareRequest) -> dict:
 
 
 @app.post("/compare/stream")
+@observe(name="compare_stream")
 async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
     """SSE: corre las strategies habilitadas en paralelo y streamea tokens.
 
@@ -413,10 +423,12 @@ async def create_plan(body: PlanCreate, request: Request):
 
 
 @app.post("/plan/parse", response_model=PlanParseResponse)
+@observe(name="plan_parse")
 def plan_parse(body: PlanParseRequest) -> dict:
     """Parse ligero Fase 2 baby: detecta plan_intent + divisions sin LLM ni DB.
 
     Útil para el front antes de guardar investigada, y para tests.
+    Langfuse @observe envía traza a http://localhost:3003/project/agro-rag si LANGFUSE_HOST seteado.
     """
     from agent.nodes.field_collector import extract_divisions
     from agent.nodes.plan_intent import is_plan_intent
