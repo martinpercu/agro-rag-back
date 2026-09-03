@@ -20,9 +20,13 @@ from pydantic import BaseModel, Field
 import instrumentation  # noqa: F401  side-effect: OTel → Langfuse local si LANGFUSE_HOST
 
 try:
-    from langfuse import get_client
+    from langfuse import Langfuse
 
-    _langfuse_client = get_client()
+    _langfuse_client = Langfuse()
+    # Validar que las keys estén (si no, cliente queda disabled)
+    if not _langfuse_client.auth_check():
+        # auth_check hace GET /api/public/projects, si falla queda disabled pero no rompe
+        pass
 except Exception:
     _langfuse_client = None
 
