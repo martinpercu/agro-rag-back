@@ -33,6 +33,19 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
   langfuse:
     image: langfuse/langfuse:3
     restart: unless-stopped
@@ -43,39 +56,60 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/langfuse
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_USER: clickhouse
       CLICKHOUSE_PASSWORD: clickhouse
       CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ""
       NEXTAUTH_URL: http://localhost:3003
       NEXTAUTH_SECRET: langfuse-nextauth-secret-local-only
       SALT: langfuse-salt-local-only
       ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: test
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: test
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://clickhouse:9000
       TELEMETRY_ENABLED: "false"
     volumes:
       - langfuse_data:/app
 
   langfuse-worker:
-    image: langfuse/langfuse:3
+    image: langfuse/langfuse-worker:3
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
-    command: ["worker"]
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/langfuse
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_USER: clickhouse
       CLICKHOUSE_PASSWORD: clickhouse
       CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ""
       NEXTAUTH_URL: http://localhost:3003
       NEXTAUTH_SECRET: langfuse-nextauth-secret-local-only
       SALT: langfuse-salt-local-only
       ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: test
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: test
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://clickhouse:9000
       TELEMETRY_ENABLED: "false"
 
 volumes:
@@ -83,3 +117,4 @@ volumes:
   ch_data:
   ch_logs:
   langfuse_data:
+  redis_data:
