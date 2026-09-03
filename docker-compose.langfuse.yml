@@ -46,6 +46,36 @@ services:
     volumes:
       - redis_data:/data
 
+  minio:
+    image: minio/minio
+    restart: unless-stopped
+    ports:
+      - "9090:9000"
+      - "9091:9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio-setup:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set myminio http://minio:9000 minio miniosecret;
+      /usr/bin/mc mb myminio/langfuse --ignore-existing;
+      exit 0;
+      "
+
   langfuse:
     image: langfuse/langfuse:3
     restart: unless-stopped
@@ -58,6 +88,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/langfuse
       CLICKHOUSE_URL: http://clickhouse:8123
@@ -67,16 +99,22 @@ services:
       CLICKHOUSE_CLUSTER_ENABLED: "false"
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      REDIS_AUTH: ""
       NEXTAUTH_URL: http://localhost:3003
       NEXTAUTH_SECRET: langfuse-nextauth-secret-local-only
       SALT: langfuse-salt-local-only
       ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
       LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
       LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
-      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: test
-      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: test
-      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://clickhouse:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
       TELEMETRY_ENABLED: "false"
     volumes:
       - langfuse_data:/app
@@ -91,6 +129,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/langfuse
       CLICKHOUSE_URL: http://clickhouse:8123
@@ -100,16 +140,22 @@ services:
       CLICKHOUSE_CLUSTER_ENABLED: "false"
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      REDIS_AUTH: ""
       NEXTAUTH_URL: http://localhost:3003
       NEXTAUTH_SECRET: langfuse-nextauth-secret-local-only
       SALT: langfuse-salt-local-only
       ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
       LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
       LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
-      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: test
-      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: test
-      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://clickhouse:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
       TELEMETRY_ENABLED: "false"
 
 volumes:
@@ -118,3 +164,4 @@ volumes:
   ch_logs:
   langfuse_data:
   redis_data:
+  minio_data:

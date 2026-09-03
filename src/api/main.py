@@ -432,10 +432,10 @@ def plan_parse(body: PlanParseRequest) -> dict:
     # Traza Langfuse manual (no @observe para no romper FastAPI signature)
     if _langfuse_client is not None:
         try:
-            with _langfuse_client.start_as_current_span(name="plan_parse", input={"question": body.question}):
+            with _langfuse_client.start_as_current_observation(as_type="span", name="plan_parse", input={"question": body.question}):
                 intent = is_plan_intent(body.question, body.history)
                 divisions = extract_divisions(body.question, body.history)
-                _langfuse_client.update_current_span(output={"plan_intent": intent, "divisions": divisions})
+                _langfuse_client.update_current_observation(output={"plan_intent": intent, "divisions": divisions})
                 return {"plan_intent": intent, "divisions": divisions, "location": {}}
         except Exception:
             pass
