@@ -210,27 +210,24 @@ def _ensure_user(db, payload: dict) -> dict:
     try:
         uid = uuid.UUID(supa_id)
     except Exception:
-        # Supabase sub may be uuid string
+        # Deterministic UUID for non-UUID subs (e.g. dev-user) — keeps same user across requests
         uid = uuid.uuid5(uuid.NAMESPACE_DNS, str(supa_id))
-        # Use deterministic but store original string in supabase_user_id if not uuid
-        # For now try to parse, if fails create with random
-        try:
-            uid = uuid.UUID(supa_id)
-        except Exception:
-            uid = uuid.uuid4()
 
     # Try to find by supabase_user_id
-    # Handle both uuid and string sub
     user = None
     try:
         user = db.query(User).filter(User.supabase_user_id == uid).first()
     except Exception:
+        db.rollback()
         user = None
     if not user and supa_id:
-        # Try string search via casting
+        # Only try string search if supa_id is a valid UUID string to avoid
+        # "invalid input syntax for type uuid" which aborts the transaction
         try:
+            uuid.UUID(str(supa_id))
             user = db.query(User).filter(User.supabase_user_id == supa_id).first()  # type: ignore
         except Exception:
+            db.rollback()
             pass
     if user:
         return {"id": str(user.id), "supabase_user_id": str(user.supabase_user_id), "email": user.email, "role": user.role, "allow_aggregated_use": user.allow_aggregated_use}

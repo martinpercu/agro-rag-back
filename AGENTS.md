@@ -76,6 +76,18 @@ uv run python scripts/embedding_bakeoff.py --models <modelos separados por coma>
 - **Tests**: pytest con `uv run pytest`. Marcar nuevos tests con `@pytest.mark.skipif("not config.getoption('--integration')")` si requieren API real
 - **No commitear**: `data/vector/`, `.venv/`, `__pycache__/`, `.env`, `.env.local`, `tmp/`, `.pytest_cache/`
 
+## Workflow de ramas (obligatorio desde 2026-09-03)
+
+Nunca a `main` directo. Baby steps en rama paralela back+front con mismo nombre:
+
+```bash
+git checkout -b feat/<nombre> && git push -u origin feat/<nombre>
+# ... commits chicos ...
+git status; git diff; git log --oneline -5
+git add <archivos> && git commit -m "feat: ..." && git push
+# PR → merge a main lo hace martin en GitHub (Railway deploya)
+```
+
 ## Si vas a tocar el comparador
 
 Las strategies viven en `src/agent/strategies/`. Cada una implementa `Strategy.retrieve()`. El runner (`runner.py`) las corre en `asyncio.gather`. El answerer es compartido via `agent.nodes.answerer.answer()`.
