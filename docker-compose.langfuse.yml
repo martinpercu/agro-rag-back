@@ -1,0 +1,85 @@
+services:
+  # Langfuse DB — host 5434 -> container 5432 (no pisa 5432 local)
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: langfuse
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - ch_data:/var/lib/clickhouse
+      - ch_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  langfuse:
+    image: langfuse/langfuse:3
+    restart: unless-stopped
+    ports:
+      - "3003:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/langfuse
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      NEXTAUTH_URL: http://localhost:3003
+      NEXTAUTH_SECRET: langfuse-nextauth-secret-local-only
+      SALT: langfuse-salt-local-only
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      TELEMETRY_ENABLED: "false"
+    volumes:
+      - langfuse_data:/app
+
+  langfuse-worker:
+    image: langfuse/langfuse:3
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    command: ["worker"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/langfuse
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      NEXTAUTH_URL: http://localhost:3003
+      NEXTAUTH_SECRET: langfuse-nextauth-secret-local-only
+      SALT: langfuse-salt-local-only
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      TELEMETRY_ENABLED: "false"
+
+volumes:
+  pg_data:
+  ch_data:
+  ch_logs:
+  langfuse_data:

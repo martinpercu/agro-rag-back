@@ -74,8 +74,13 @@ def is_plan_intent(question: str, history: list[dict] | None = None) -> bool:
     # 3) historial: si ya venía hablando de plan, mantener intent
     if history:
         last = " ".join(str(m.get("content", "")) for m in history[-3:]).lower()
-        if any(kw in last for kw in ("plan de siembra", "hectareas", "hectáreas", "ha ")) and _HA_RE.search(q):
-            return True
+        has_ha_in_history = bool(_HA_RE.search(last) or "hectareas" in last or "hectáreas" in last or "ha " in last)
+        if has_ha_in_history:
+            # q con ha o con cultivo => continuación de plan
+            if _HA_RE.search(q) or any(c in q for c in ("soja", "maiz", "maíz", "trigo", "girasol", "cebada", "sorgo", "cultivo", "siembra")):
+                return True
+            if any(kw in last for kw in ("plan de siembra", "hectareas", "hectáreas")) and _HA_RE.search(q):
+                return True
 
     return False
 

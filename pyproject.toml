@@ -29,6 +29,9 @@ dependencies = [
     "pyjwt>=2.8",
     "httpx>=0.28.1",
     "psycopg2-binary>=2.9",
+    "langfuse>=2.80",
+    "openinference-instrumentation-langchain>=0.1",
+    "openinference-instrumentation-openai>=0.1",
 ]
 
 [dependency-groups]
