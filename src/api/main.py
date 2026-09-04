@@ -151,7 +151,7 @@ async def compare(req: CompareRequest) -> dict:
 
 
 @app.post("/compare/stream")
-async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
+async def compare_stream(req: CompareStreamRequest, request: Request) -> StreamingResponse:
     """SSE: corre las strategies habilitadas en paralelo y streamea tokens.
 
     Body: {question, enabled?, history?, k?, lang?}
@@ -199,6 +199,105 @@ async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
     else:
         names = [s.name for s in all_strategies]
         strategies = get_strategies_by_names(names, **hybrid_kwargs)
+
+    # Trace separado por naturaleza:
+    # - Lab (/dev) multi-strategy -> lab:compare_stream tags lab session lab (usuario unico)
+    # - Producto (/ → baseline only) -> user:compare_stream tags user session tester (streaming mantenido)
+    # Distingue por enabled == ["baseline"] (producto) vs resto (lab)
+    is_lab = not (req.enabled is not None and len(req.enabled) == 1 and req.enabled[0] == "baseline")
+    if is_lab:
+        trace_name = "lab:compare_stream"
+        trace_session = "lab"
+        trace_user = "lab"
+        trace_tags = ["lab"]
+    else:
+        trace_session = _extract_session_id(request)
+        trace_user = trace_session
+        trace_name = "user:compare_stream"
+        trace_tags = ["user"]
+
+    lf = _get_langfuse()
+    if lf is not None:
+        # Wrap streaming in trace — context stays alive during async iteration
+        async def _format_events():
+            try:
+                from observability import start_as_current_observation, update_current_observation, flush  # type: ignore
+
+                with start_as_current_observation(
+                    name=trace_name,
+                    as_type="span",
+                    input={
+                        "question": req.question,
+                        "history": req.history,
+                        "enabled": [s.name for s in strategies],
+                        "k": req.k or 6,
+                    },
+                    session_id=trace_session,
+                    user_id=trace_user,
+                    tags=trace_tags,
+                    metadata={"enabled": [s.name for s in strategies], "lang": req.lang},
+                ) as _span:
+                    done_count = 0
+                    error_count = 0
+                    async for msg in run_compare_stream(
+                        req.question, req.history, req.k or 6, strategies, temperature=req.temperature
+                    ):
+                        name = msg["strategy"]
+                        typ = msg["type"]
+                        data = msg["data"]
+
+                        if typ == "token":
+                            yield f"event: strategy_token\ndata: {json.dumps({'strategy': name, 'text': data})}\n\n"
+                        elif typ == "retrieve_done":
+                            payload: dict = {"strategy": name, **data}
+                            yield f"event: strategy_retrieve\ndata: {json.dumps(payload)}\n\n"
+                        elif typ == "done":
+                            done_count += 1
+                            payload = {"strategy": name, **data}
+                            yield f"event: strategy_done\ndata: {json.dumps(payload)}\n\n"
+                        elif typ == "error":
+                            error_count += 1
+                            yield f"event: strategy_error\ndata: {json.dumps({'strategy': name, 'error': data})}\n\n"
+                    # Update trace output after stream finishes
+                    try:
+                        update_current_observation(
+                            output={"done": done_count, "errors": error_count, "strategies": [s.name for s in strategies]}
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        flush()
+                    except Exception:
+                        pass
+            except Exception:
+                # Fallback without Langfuse if helper fails
+                async for msg in run_compare_stream(
+                    req.question, req.history, req.k or 6, strategies, temperature=req.temperature
+                ):
+                    name = msg["strategy"]
+                    typ = msg["type"]
+                    data = msg["data"]
+
+                    if typ == "token":
+                        yield f"event: strategy_token\ndata: {json.dumps({'strategy': name, 'text': data})}\n\n"
+                    elif typ == "retrieve_done":
+                        payload: dict = {"strategy": name, **data}
+                        yield f"event: strategy_retrieve\ndata: {json.dumps(payload)}\n\n"
+                    elif typ == "done":
+                        payload = {"strategy": name, **data}
+                        yield f"event: strategy_done\ndata: {json.dumps(payload)}\n\n"
+                    elif typ == "error":
+                        yield f"event: strategy_error\ndata: {json.dumps({'strategy': name, 'error': data})}\n\n"
+
+        return StreamingResponse(
+            _format_events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     async def _format_events():
         async for msg in run_compare_stream(
@@ -505,10 +604,11 @@ class GraphRequest(BaseModel):
 
 @app.post("/chat")
 async def chat(req: GraphRequest, request: Request) -> dict:
-    """Chat full graph: classifier→plan_intent→field_collector→retriever→answerer.
+    """Chat producto: classifier→plan_intent→field_collector→retriever→answerer.
 
-    Traza Langfuse 5 nodos con session_id=user_id (supabase_user_id o anon).
-    Sin OTel, solo SDK manual. Usado para verificar grafo completo en 3003.
+    Traza Langfuse 5 nodos con session_id=user_id (supabase_user_id o anon) — separada de lab.
+    name="user:chat" tags no lab, session distingue usuarios autenticados en Langfuse Users/Sessions.
+    Sin OTel, solo SDK manual.
     """
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
@@ -516,14 +616,14 @@ async def chat(req: GraphRequest, request: Request) -> dict:
     session_id = _extract_session_id(request)
     lf = _get_langfuse()
 
-    # Fast path: with Langfuse trace
+    # Fast path: with Langfuse trace user:chat (prod, por usuario)
     if lf is not None:
         try:
             from langfuse import propagate_attributes  # type: ignore
 
             with propagate_attributes(session_id=session_id, user_id=session_id):
                 with lf.start_as_current_observation(
-                    name="chat",
+                    name="user:chat",
                     as_type="span",
                     input={"question": req.question, "history": req.history},
                     metadata={"session_id": session_id},

@@ -102,15 +102,16 @@ def start_as_current_observation(
     metadata: dict | None = None,
     session_id: str | None = None,
     user_id: str | None = None,
+    tags: list[str] | None = None,
     model: str | None = None,
     usage_details: dict | None = None,
     **kwargs: Any,
 ) -> Generator[Any, None, None]:
-    """Wrapper around Langfuse.start_as_current_observation with session_id support.
+    """Wrapper around Langfuse.start_as_current_observation with session_id/tags support.
 
     - If Langfuse disabled, yields None (no-op).
-    - If session_id/user_id given, wraps in `propagate_attributes` so the observation
-      and all children get those trace attributes (user wants session_id=user_id).
+    - If session_id/user_id/tags given, wraps in `propagate_attributes` so the observation
+      and all children get those trace attributes (user wants session_id=user_id, lab uses tags).
     - For generation/retriever, pass as_type accordingly; for answerer add model/usage_details.
     """
     lf = get_langfuse()
@@ -118,16 +119,37 @@ def start_as_current_observation(
         yield None
         return
 
-    # If session/user provided, propagate so trace gets session_id
-    if session_id or user_id:
+    # If session/user/tags provided, propagate so trace gets them
+    if session_id or user_id or tags:
         try:
             from langfuse import propagate_attributes  # type: ignore
         except Exception:
-            propagate_attributes = nullcontext  # type: ignore
+            propagate_attributes = nullcontext  # type: ignore  # type: ignore
 
         # propagate_attributes is itself a contextmanager
         try:
-            with propagate_attributes(session_id=session_id, user_id=user_id):  # type: ignore
+            # Build kwargs for propagate_attributes (only pass non-None)
+            _pa_kwargs: dict[str, Any] = {}
+            if session_id is not None:
+                _pa_kwargs["session_id"] = session_id
+            if user_id is not None:
+                _pa_kwargs["user_id"] = user_id
+            if tags is not None:
+                _pa_kwargs["tags"] = tags
+            if _pa_kwargs:
+                with propagate_attributes(**_pa_kwargs):  # type: ignore
+                    with lf.start_as_current_observation(  # type: ignore
+                        name=name,
+                        as_type=as_type,  # type: ignore
+                        input=input,
+                        output=output,
+                        metadata=metadata,
+                        model=model,
+                        usage_details=usage_details,
+                        **kwargs,
+                    ) as obs:
+                        yield obs
+            else:
                 with lf.start_as_current_observation(  # type: ignore
                     name=name,
                     as_type=as_type,  # type: ignore
