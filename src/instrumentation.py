@@ -1,7 +1,7 @@
-"""OTel instrumentation → Langfuse local only (3003).
+"""Langfuse SDK → Langfuse local only (3003).
 
 Solo se activa si LANGFUSE_HOST está seteado (en .env.local). En Railway (sin esa var)
-no hace nada — prod no traza.
+no hace nada — prod no traza. Usa `from langfuse import observe` en los handlers.
 """
 from __future__ import annotations
 
@@ -11,9 +11,11 @@ _ENABLED = False
 
 
 def setup_instrumentation() -> bool:
-    """Registra instrumentación OpenAI + LangChain hacia Langfuse/OTel.
+    """Valida Langfuse env y prepara flush.
 
-    Returns True si se activó, False si está deshabilitado (sin env).
+    No hace OTel por defecto para evitar `Connection reset by peer` del exporter
+    `http://localhost:3003/api/public/otel/v1/traces`. El trazado real lo hace
+    `@observe(name=...)` de `from langfuse import observe` en `api/main.py`.
     """
     global _ENABLED
     if _ENABLED:
@@ -23,52 +25,19 @@ def setup_instrumentation() -> bool:
     if not host:
         return False
 
-    # Langfuse envs ya deben estar en .env.local: PUBLIC_KEY / SECRET_KEY
-    # Para OpenInference, usamos el endpoint OTLP de Langfuse si existe,
-    # sino el SDK de Langfuse directamente.
+    # Verificar que las keys existen y el SDK puede instanciarse
     try:
-        # 1) OpenTelemetry base
-        from opentelemetry import trace
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from langfuse import Langfuse
 
-        # 2) Langfuse OTLP exporter (si langfuse está disponible)
-        # Intentamos con OpenInference si está, sino fallback silencioso
-        provider = TracerProvider()
-        trace.set_tracer_provider(provider)
-
-        # Si hay un OTLP endpoint (Langfuse 3 expone /api/public/otel/v1/traces)
-        # Lo configuramos si el user puso LANGFUSE_OTLP_URL, sino no exportamos
-        otlp_url = os.getenv("LANGFUSE_OTLP_URL", "").strip()
-        if otlp_url:
-            try:
-                from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-
-                exporter = OTLPSpanExporter(endpoint=otlp_url)
-                provider.add_span_processor(BatchSpanProcessor(exporter))
-            except Exception:
-                pass
-
-        # 3) Instrumentadores OpenInference (no rompen si no hay exporter)
-        try:
-            from openinference.instrumentation.langchain import LangChainInstrumentor
-
-            LangChainInstrumentor().instrument()
-        except Exception:
-            pass
-        try:
-            from openinference.instrumentation.openai import OpenAIInstrumentor
-
-            OpenAIInstrumentor().instrument()
-        except Exception:
-            pass
-
-        # 4) Langfuse SDK para trazas explícitas (opcional)
-        # Se usa via `from langfuse import get_client` en los nodos si se quiere
-        _ENABLED = True
-        return True
+        pk = os.getenv("LANGFUSE_PUBLIC_KEY", "").strip()
+        sk = os.getenv("LANGFUSE_SECRET_KEY", "").strip()
+        if pk and sk:
+            Langfuse()  # valida auth_check internamente
     except Exception:
-        return False
+        pass
+
+    _ENABLED = True
+    return True
 
 
 # Auto-setup al importar (no bloquea si no hay env)

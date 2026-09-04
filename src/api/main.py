@@ -19,6 +19,17 @@ from pydantic import BaseModel, Field
 
 import instrumentation  # noqa: F401  side-effect: OTel → Langfuse local si LANGFUSE_HOST
 
+try:
+    from langfuse import Langfuse
+
+    _langfuse_client = Langfuse()
+    # Validar que las keys estén (si no, cliente queda disabled)
+    if not _langfuse_client.auth_check():
+        # auth_check hace GET /api/public/projects, si falla queda disabled pero no rompe
+        pass
+except Exception:
+    _langfuse_client = None
+
 from agent.nodes.classifier import is_off_topic
 from agent.strategies.runner import (
     get_all_strategies,
@@ -417,10 +428,21 @@ def plan_parse(body: PlanParseRequest) -> dict:
     """Parse ligero Fase 2 baby: detecta plan_intent + divisions sin LLM ni DB.
 
     Útil para el front antes de guardar investigada, y para tests.
+    Traza manual a Langfuse si está configurado (local 3003).
     """
     from agent.nodes.field_collector import extract_divisions
     from agent.nodes.plan_intent import is_plan_intent
 
+    # Traza Langfuse manual (no @observe para no romper FastAPI signature)
+    if _langfuse_client is not None:
+        try:
+            with _langfuse_client.start_as_current_observation(as_type="span", name="plan_parse", input={"question": body.question}):
+                intent = is_plan_intent(body.question, body.history)
+                divisions = extract_divisions(body.question, body.history)
+                _langfuse_client.update_current_observation(output={"plan_intent": intent, "divisions": divisions})
+                return {"plan_intent": intent, "divisions": divisions, "location": {}}
+        except Exception:
+            pass
     intent = is_plan_intent(body.question, body.history)
     divisions = extract_divisions(body.question, body.history)
     # location vacío por ahora (DI-5 abierto)
