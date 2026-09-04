@@ -1,43 +1,33 @@
-"""Langfuse SDK → Langfuse local only (3003).
+"""Langfuse SDK → Langfuse local only (3003) — deprecated shim.
 
 Solo se activa si LANGFUSE_HOST está seteado (en .env.local). En Railway (sin esa var)
-no hace nada — prod no traza. Usa `from langfuse import observe` en los handlers.
+no hace nada — prod no traza. Usa `from observability import get_langfuse` en los handlers.
+Este archivo queda por compatibilidad con `import instrumentation` en api/main.py;
+la logica nueva vive en `observability.py` (manual SDK 2.80, sin OTel).
 """
 from __future__ import annotations
 
-import os
+# Re-export from observability (canonical)
+try:
+    from observability import get_langfuse, is_enabled  # noqa: F401
 
-_ENABLED = False
+    _ENABLED = is_enabled()
+except Exception:
+    _ENABLED = False
 
 
 def setup_instrumentation() -> bool:
-    """Valida Langfuse env y prepara flush.
+    """No OTel — solo valida que Langfuse esté configurado.
 
-    No hace OTel por defecto para evitar `Connection reset by peer` del exporter
-    `http://localhost:3003/api/public/otel/v1/traces`. El trazado real lo hace
-    `@observe(name=...)` de `from langfuse import observe` en `api/main.py`.
+    Evita `Connection reset by peer` del exporter
+    `http://localhost:3003/api/public/otel/v1/traces`.
     """
-    global _ENABLED
-    if _ENABLED:
-        return True
-
-    host = os.getenv("LANGFUSE_HOST", "").strip()
-    if not host:
-        return False
-
-    # Verificar que las keys existen y el SDK puede instanciarse
     try:
-        from langfuse import Langfuse
+        from observability import is_enabled as _is_enabled
 
-        pk = os.getenv("LANGFUSE_PUBLIC_KEY", "").strip()
-        sk = os.getenv("LANGFUSE_SECRET_KEY", "").strip()
-        if pk and sk:
-            Langfuse()  # valida auth_check internamente
+        return _is_enabled()
     except Exception:
-        pass
-
-    _ENABLED = True
-    return True
+        return False
 
 
 # Auto-setup al importar (no bloquea si no hay env)

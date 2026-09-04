@@ -155,17 +155,42 @@ def field_collector_node(state: AgentState) -> AgentState:
     """
     question = state.get("question", "")
     history = state.get("history") if isinstance(state.get("history"), list) else None
-    extracted = extract_divisions(question, history)  # type: ignore[arg-type]
 
-    # Si el state ya tenía divisions de una investigada continuada, no pisar con vacío
+    # Langfuse span (if enabled)
+    try:
+        from observability import get_langfuse
+
+        lf = get_langfuse()
+        if lf is not None:
+            with lf.start_as_current_observation(
+                name="field_collector",
+                as_type="span",
+                input={"question": question, "history": history},
+            ) as _span:
+                extracted = extract_divisions(question, history)  # type: ignore[arg-type]
+                existing = state.get("divisions")
+                if extracted:
+                    state["divisions"] = extracted
+                elif existing is None:
+                    state["divisions"] = []
+                if state.get("location") is None:
+                    state["location"] = {}
+                try:
+                    lf.update_current_span(
+                        output={"divisions": state.get("divisions"), "location": state.get("location")}
+                    )
+                except Exception:
+                    pass
+                return state
+    except Exception:
+        pass
+
+    extracted = extract_divisions(question, history)  # type: ignore[arg-type]
     existing = state.get("divisions")
     if extracted:
         state["divisions"] = extracted
     elif existing is None:
         state["divisions"] = []
-
-    # location abierto: por ahora vacío, no extraemos aún (baby step)
     if state.get("location") is None:
         state["location"] = {}
-
     return state

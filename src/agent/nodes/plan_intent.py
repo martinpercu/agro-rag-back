@@ -88,7 +88,26 @@ def is_plan_intent(question: str, history: list[dict] | None = None) -> bool:
 def plan_intent_node(state: AgentState) -> AgentState:
     """Nodo LangGraph: anota plan_intent en el state."""
     question = state.get("question", "")
-    # history puede venir en state como lista de dicts {role, content}
     history = state.get("history")  # type: ignore[attr-defined]
+    # Langfuse span
+    try:
+        from observability import get_langfuse
+
+        lf = get_langfuse()
+        if lf is not None:
+            with lf.start_as_current_observation(
+                name="plan_intent",
+                as_type="span",
+                input={"question": question, "history": history},
+            ) as _span:
+                result = is_plan_intent(question, history if isinstance(history, list) else None)
+                state["plan_intent"] = result  # type: ignore
+                try:
+                    lf.update_current_span(output={"plan_intent": result})
+                except Exception:
+                    pass
+                return state
+    except Exception:
+        pass
     state["plan_intent"] = is_plan_intent(question, history if isinstance(history, list) else None)  # type: ignore
     return state

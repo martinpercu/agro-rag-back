@@ -262,8 +262,8 @@ def answerer_node(state: AgentState) -> AgentState:
 
     question = state["question"]
     retrieved = state.get("retrieved", [])
-    # Convertir tuples (chunk_dict, score) a RetrievedItem para reusar
-    # la misma logica que answer()
+    history = state.get("history")
+    # Convertir tuples (chunk_dict, score) a RetrievedItem para reusar la misma logica que answer()
     items: list[RetrievedItem] = []
     for chunk_dict, score in retrieved:
         meta = chunk_dict.get("metadata", {})
@@ -280,6 +280,49 @@ def answerer_node(state: AgentState) -> AgentState:
                 rank=0,
             )
         )
+
+    # Langfuse generation span (local-only)
+    try:
+        from observability import get_langfuse
+
+        lf = get_langfuse()
+        if lf is not None:
+            # Build input for generation
+            with lf.start_as_current_observation(
+                name="answerer",
+                as_type="generation",
+                input={"question": question, "history": history, "retrieved_count": len(items)},
+                model=llm_model(),
+                metadata={"temperature": TEMPERATURE},
+            ) as _gen:
+                result = answer(question, items)
+                state["answer"] = result["answer"]
+                state["sources"] = result["sources"]
+                try:
+                    lf.update_current_generation(
+                        output={"answer": result["answer"], "sources": result["sources"]},
+                        usage_details={
+                            "input": result.get("input_tokens", 0),
+                            "output": result.get("output_tokens", 0),
+                        },
+                        model=llm_model(),
+                    )
+                except Exception:
+                    try:
+                        lf.update_current_span(
+                            output={"answer": result["answer"], "sources": result["sources"]},
+                            metadata={
+                                "model": llm_model(),
+                                "input_tokens": result.get("input_tokens", 0),
+                                "output_tokens": result.get("output_tokens", 0),
+                            },
+                        )
+                    except Exception:
+                        pass
+                return state
+    except Exception:
+        pass
+
     result = answer(question, items)
     state["answer"] = result["answer"]
     state["sources"] = result["sources"]
