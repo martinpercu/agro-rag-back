@@ -151,7 +151,7 @@ async def compare(req: CompareRequest) -> dict:
 
 
 @app.post("/compare/stream")
-async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
+async def compare_stream(req: CompareStreamRequest, request: Request) -> StreamingResponse:
     """SSE: corre las strategies habilitadas en paralelo y streamea tokens.
 
     Body: {question, enabled?, history?, k?, lang?}
@@ -200,17 +200,31 @@ async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
         names = [s.name for s in all_strategies]
         strategies = get_strategies_by_names(names, **hybrid_kwargs)
 
-    # Lab trace: lab:compare_stream (research, separado de user:chat)
-    # Usa session_id="lab" fijo, tags=["lab"], no depende del usuario (lab es unico)
+    # Trace separado por naturaleza:
+    # - Lab (/dev) multi-strategy -> lab:compare_stream tags lab session lab (usuario unico)
+    # - Producto (/ → baseline only) -> user:compare_stream tags user session tester (streaming mantenido)
+    # Distingue por enabled == ["baseline"] (producto) vs resto (lab)
+    is_lab = not (req.enabled is not None and len(req.enabled) == 1 and req.enabled[0] == "baseline")
+    if is_lab:
+        trace_name = "lab:compare_stream"
+        trace_session = "lab"
+        trace_user = "lab"
+        trace_tags = ["lab"]
+    else:
+        trace_session = _extract_session_id(request)
+        trace_user = trace_session
+        trace_name = "user:compare_stream"
+        trace_tags = ["user"]
+
     lf = _get_langfuse()
     if lf is not None:
-        # Wrap streaming in lab trace — context stays alive during async iteration
+        # Wrap streaming in trace — context stays alive during async iteration
         async def _format_events():
             try:
                 from observability import start_as_current_observation, update_current_observation, flush  # type: ignore
 
                 with start_as_current_observation(
-                    name="lab:compare_stream",
+                    name=trace_name,
                     as_type="span",
                     input={
                         "question": req.question,
@@ -218,11 +232,11 @@ async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
                         "enabled": [s.name for s in strategies],
                         "k": req.k or 6,
                     },
-                    session_id="lab",
-                    user_id="lab",
-                    tags=["lab"],
+                    session_id=trace_session,
+                    user_id=trace_user,
+                    tags=trace_tags,
                     metadata={"enabled": [s.name for s in strategies], "lang": req.lang},
-                ) as _lab_span:
+                ) as _span:
                     done_count = 0
                     error_count = 0
                     async for msg in run_compare_stream(
@@ -244,7 +258,7 @@ async def compare_stream(req: CompareStreamRequest) -> StreamingResponse:
                         elif typ == "error":
                             error_count += 1
                             yield f"event: strategy_error\ndata: {json.dumps({'strategy': name, 'error': data})}\n\n"
-                    # Update lab trace output after stream finishes
+                    # Update trace output after stream finishes
                     try:
                         update_current_observation(
                             output={"done": done_count, "errors": error_count, "strategies": [s.name for s in strategies]}
