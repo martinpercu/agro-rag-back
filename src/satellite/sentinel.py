@@ -110,17 +110,21 @@ class SentinelHubClient:
         date_to: str,
         aggregation: str = "P5D",
         max_cloud: int = 10,
-        resolution: int = 10,
+        resolution_m: int = 10,
     ) -> list[dict]:
         """Mean NDVI per aggregation bucket for a GeoJSON Polygon (EPSG:4326).
 
         Dates "YYYY-MM-DD". aggregation "P5D" (default, ~Sentinel-2 revisit,
-        less PU) or "P1D". Returns [{date_from, date_to, ndvi_mean|None, ...}]
-        keeping empty (fully cloudy) buckets with ndvi_mean None.
+        less PU) or "P1D". resolution_m is converted to degrees because the
+        Statistical API interprets resx/resy in the geometry CRS units
+        (EPSG:4326 -> degrees, ~111320 m/deg). Returns
+        [{date_from, date_to, ndvi_mean|None, ...}] keeping empty (fully
+        cloudy) buckets with ndvi_mean None.
         """
         from satellite.geo import validate_polygon
 
         validated = validate_polygon(polygon)["polygon"]
+        res_deg = resolution_m / 111_320.0
         payload = {
             "input": {
                 "bounds": {
@@ -141,8 +145,8 @@ class SentinelHubClient:
                 "timeRange": {"from": f"{date_from}T00:00:00Z", "to": f"{date_to}T23:59:59Z"},
                 "aggregationInterval": {"of": aggregation},
                 "evalscript": NDVI_EVALSCRIPT,
-                "resx": resolution,
-                "resy": resolution,
+                "resx": res_deg,
+                "resy": res_deg,
             },
             "calculations": {"default": {}},
         }

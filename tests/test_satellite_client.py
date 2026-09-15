@@ -57,7 +57,9 @@ def test_token_cached_between_calls():
     assert calls["token"] == 1
 
 
-def test_missing_creds_without_http():
+def test_missing_creds_without_http(monkeypatch):
+    monkeypatch.delenv("SENTINEL_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SENTINEL_CLIENT_SECRET", raising=False)
     c = SentinelHubClient(client_id="", client_secret="")
     with pytest.raises(SentinelAuthError):
         c.get_token()
@@ -93,7 +95,7 @@ def test_timeseries_parses_buckets_and_keeps_empty():
     assert cloudy["ndvi_mean"] is None and cloudy["empty"] is True
     agg = seen["payload"]["aggregation"]
     assert agg["aggregationInterval"] == {"of": "P5D"}
-    assert agg["resx"] == 10 and agg["resy"] == 10
+    assert agg["resx"] == agg["resy"] == pytest.approx(10 / 111_320.0)  # meters -> degrees (EPSG:4326)
     assert "B04" in agg["evalscript"] and "B08" in agg["evalscript"]
     data_filter = seen["payload"]["input"]["data"][0]["dataFilter"]
     assert data_filter["maxCloudCoverage"] == 10
