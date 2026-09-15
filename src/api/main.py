@@ -35,6 +35,7 @@ from agent.strategies.runner import (
     run_compare_stream,
 )
 from ingestion.vector_store import get_vector_store, vector_store_name
+from satellite.cache import TTLCache
 from satellite.geo import normalize_location
 
 load_dotenv()
@@ -606,6 +607,105 @@ def plan_parse(body: PlanParseRequest, request: Request) -> dict:
     divisions = extract_divisions(body.question, body.history)
     # location vacío por ahora (DI-5 abierto)
     return {"plan_intent": intent, "divisions": divisions, "location": {}}
+
+
+class SatelliteNDVIRequest(BaseModel):
+    # Either shape accepted; polygon wins if both present.
+    location: dict | None = None  # {} legacy | {lat,lng,ha} | {vertices} | {bbox} | {polygon}
+    polygon: dict | None = None  # GeoJSON Polygon (EPSG:4326)
+    date_from: str | None = None  # YYYY-MM-DD, default today-90d
+    date_to: str | None = None  # YYYY-MM-DD, default today
+    aggregation: str = "P5D"  # P5D (default, less PU) or P1D
+
+
+def _parse_day(value: str | None, field: str):
+    if value is None:
+        return None
+    from datetime import datetime as _dt
+
+    try:
+        return _dt.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"{field} must be YYYY-MM-DD, got {value!r}")
+
+
+_SAT_SERIES_CACHE = TTLCache(ttl_s=86_400.0)
+
+
+def _sat_cache_key(polygon: dict, date_from: str, date_to: str, aggregation: str) -> str:
+    import hashlib as _hashlib
+    import json as _json
+
+    canonical = _json.dumps(polygon, sort_keys=True, separators=(",", ":"))
+    return _hashlib.sha1(f"{canonical}|{date_from}|{date_to}|{aggregation}".encode()).hexdigest()
+
+
+@app.get("/satellite/health")
+def satellite_health() -> dict:
+    """Check Sentinel Hub wiring without spending PU (token request only)."""
+    from satellite.sentinel import SentinelAuthError, SentinelHubClient
+
+    try:
+        SentinelHubClient().get_token()
+        return {"configured": True, "token_ok": True}
+    except SentinelAuthError as e:
+        return {"configured": False, "token_ok": False, "error": str(e)[:200]}
+
+
+@app.post("/satellite/ndvi")
+def satellite_ndvi(body: SatelliteNDVIRequest) -> dict:
+    """NDVI time series for a field polygon (Sentinel-2, separate from RAG).
+
+    Open endpoint (like /plan/parse); quota protected by 24h server cache.
+    """
+    from datetime import date as _date
+    from datetime import timedelta as _td
+
+    from satellite.sentinel import SentinelAuthError, SentinelError, SentinelHubClient, SentinelQuotaError
+
+    raw = body.polygon if body.polygon is not None else body.location
+    try:
+        norm = normalize_location(raw)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    if not norm:
+        raise HTTPException(status_code=422, detail="location or polygon is required")
+    agg = (body.aggregation or "P5D").upper()
+    if agg not in ("P1D", "P5D"):
+        raise HTTPException(status_code=422, detail="aggregation must be P1D or P5D")
+    to_day = _parse_day(body.date_to, "date_to") or _date.today()
+    from_day = _parse_day(body.date_from, "date_from") or (to_day - _td(days=90))
+    if from_day > to_day:
+        raise HTTPException(status_code=422, detail="date_from must be <= date_to")
+    if (to_day - from_day).days > 365:
+        raise HTTPException(status_code=422, detail="date range must be <= 365 days (quota guard)")
+    key = _sat_cache_key(norm["polygon"], from_day.isoformat(), to_day.isoformat(), agg)
+    hit = _SAT_SERIES_CACHE.get(key)
+    if hit is not None:
+        return {**hit, "cached": True}
+    try:
+        series = SentinelHubClient().ndvi_timeseries(
+            norm["polygon"], from_day.isoformat(), to_day.isoformat(), aggregation=agg
+        )
+    except SentinelQuotaError as e:
+        raise HTTPException(status_code=429, detail=str(e)[:300])
+    except SentinelAuthError as e:
+        raise HTTPException(status_code=500, detail=f"satellite not configured: {e}"[:300])
+    except SentinelError as e:
+        raise HTTPException(status_code=502, detail=str(e)[:500])
+    out = {
+        "series": series,
+        "polygon": norm["polygon"],
+        "centroid": norm["centroid"],
+        "area_ha": norm["area_ha"],
+        "origin": norm["origin"],
+        "aggregation": agg,
+        "date_from": from_day.isoformat(),
+        "date_to": to_day.isoformat(),
+        "cached": False,
+    }
+    _SAT_SERIES_CACHE.set(key, out)
+    return out
 
 
 class GraphRequest(BaseModel):

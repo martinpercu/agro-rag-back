@@ -124,6 +124,13 @@ def test_normalize_unknown_shape_rejects():
         normalize_location({"lat": LAT})  # incompleto
 
 
+def test_normalize_raw_geojson_polygon():
+    poly = to_polygon_point_radius(LAT, LNG, 2.0)
+    out = normalize_location(poly)  # sin wrapper {"polygon": ...}
+    assert out["origin"]["mode"] == "polygon"
+    assert out["area_ha"] == pytest.approx(2.0, rel=0.03)
+
+
 def test_vertices_within_20ha_radius():
     poly = to_polygon_point_radius(LAT, LNG, 20.0)
     ring = poly["coordinates"][0][:-1]

@@ -209,6 +209,8 @@ def normalize_location(location: dict | None) -> dict:
 
     if "polygon" in location:
         return wrap(validate_polygon(location["polygon"]), "polygon")
+    if location.get("type") == "Polygon" and "coordinates" in location:
+        return wrap(validate_polygon(location), "polygon")
     if "lat" in location and "lng" in location and "ha" in location:
         poly = to_polygon_point_radius(location["lat"], location["lng"], location["ha"])
         v = validate_polygon(poly)
