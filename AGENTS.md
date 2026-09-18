@@ -8,6 +8,8 @@ Stack: Python 3.13 + FastAPI + LangGraph + ChromaDB/Pinecone + OpenAI gpt-4.1-na
 
 **State 2026-09-04:** single DB 768 `text-embedding-nomic-embed-text-v1.5` in Chroma local (107 docs, `VECTOR_STORE=chroma`) and `text-embedding-3-small__d768` in Pinecone `agro-vectorstore` 768 cosine serverless (107 docs, `VECTOR_STORE=pinecone`). 5-node LangGraph `classifier→plan_intent→field_collector→retriever→answerer` fully traced with Langfuse local-only (lab vs user separation). All feature branches merged to `main` (`ddde9a6`).
 
+**State 2026-09-15 (satellite, unmerged):** `src/satellite/` module (Sentinel-2 NDVI, fully separate from RAG) on stacked branches `feat/sat-location-contract` → `feat/sat-sentinel-client` → `feat/sat-ndvi-endpoint` (each contains its parent). Live-verified against Copernicus with real OAuth client. See Satellite section below.
+
 ## Stack local vs OpenAI (provider factory)
 
 All clients via `src/agent/llm.py` reading env vars:
@@ -24,6 +26,7 @@ All clients via `src/agent/llm.py` reading env vars:
 | `PINECONE_API_KEY` / `PINECONE_INDEX` | — | Only if `VECTOR_STORE=pinecone` |
 | `SUPABASE_URL` / `SUPABASE_ANON_KEY` / `SUPABASE_JWT_AUD` | — | Supabase Auth (see Auth section) |
 | `DATABASE_URL` | — | Railway Postgres (`postgresql+psycopg://...@altaria.proxy.rlwy.net:42134/railway`) |
+| `SENTINEL_CLIENT_ID` / `SENTINEL_CLIENT_SECRET` | — | Copernicus OAuth client (satellite NDVI, see Satellite section; never commit) |
 | `LANGFUSE_HOST` / `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | — | Local Langfuse `http://localhost:3003` (never in `.env`, only `.env.local`) |
 
 - `collection_name()` derives collection from embedding model + dims: default keeps `margenes_agropecuarios` (1536), with `AGROPOSTA_EMBEDDING_DIMS=768` → `margenes_agropecuarios__d768`. Other models → `margenes_agropecuarios__<modelo>`.
@@ -34,7 +37,7 @@ All clients via `src/agent/llm.py` reading env vars:
 
 ## Key structure
 
-- `src/api/main.py`: FastAPI app — `/`, `/stats`, `/chat` (graph, `user:chat`), `/compare`, `/compare/stream` (lab `lab:compare_stream` vs product `user:compare_stream`), `/plan/parse`, `/export-pdf`, `/me`, `/investigations`, `/plans`, `/editions`
+- `src/api/main.py`: FastAPI app — `/`, `/stats`, `/chat` (graph, `user:chat`), `/compare`, `/compare/stream` (lab `lab:compare_stream` vs product `user:compare_stream`), `/plan/parse`, `/export-pdf`, `/me`, `/investigations`, `/plans`, `/editions`, `/satellite/ndvi` + `/satellite/health` (Sentinel-2, open, 24h cache)
 - `src/agent/graph.py`: LangGraph `make_graph()` with 5 nodes: `classifier` → `plan_intent` → `field_collector` → `retriever` → `answerer` (`StateGraph(AgentState)`)
 - `src/agent/nodes/`: `classifier.py` (rule-based intent), `plan_intent.py` (`is_plan_intent`), `field_collector.py` (`extract_divisions`), `retriever.py` (`search` with `INTENT_TO_SECTION`), `answerer.py` (rioplatense system prompt `gpt-4.1-nano`, `answer()` + `answerer_node()` + streaming)
 - `src/observability.py`: canonical Langfuse helper SDK 2.80 — `get_langfuse()`, `start_as_current_observation(..., session_id, user_id, tags, model, usage_details)`, `update_current_observation()`, `flush()` (no OTel)
@@ -44,7 +47,9 @@ All clients via `src/agent/llm.py` reading env vars:
 - `src/ingestion/`: extractor (pdfplumber), chunker, indexer (ChromaDB)
 - `src/db/`: SQLAlchemy models (`User`, `Investigation`, `Plan`, `Session`), `session.py` (`get_db`)
 - `src/api/auth.py`: Supabase JWT verification (JWKS ES256, 10min cache)
-- `tests/`: unit + integration, golden questions `tests/golden_questions.json` / `tests/golden_compare_questions.json`
+- `src/satellite/`: Sentinel-2 NDVI module, fully separate from RAG (no LLM, no vector store) — `geo.py` (location contract), `sentinel.py` (OAuth + Statistical API client), `cache.py` (TTLCache)
+- `scripts/satellite_demo.py`: live NDVI demo (needs `SENTINEL_*` creds, exits 2 without them)
+- `tests/`: unit + integration, golden questions `tests/golden_questions.json` / `tests/golden_compare_questions.json`, satellite `tests/test_location_geo.py` / `tests/test_satellite_client.py` / `tests/test_api_satellite.py` (mocked HTTP, no quota spend)
 
 ## Useful commands — switch local:on/off + vectorstore
 
@@ -67,7 +72,7 @@ curl http://127.0.0.1:8002/stats | jq .total       # → 107
 uv run python scripts/ingest_magazine.py data/raw/<file>.pdf
 
 # Tests
-uv run pytest tests/                    # unit (131 passed)
+uv run pytest tests/                    # unit (160 passed, 33 skipped without --integration)
 uv run pytest tests/ --integration      # with real OpenAI
 
 # Compare report
@@ -119,6 +124,23 @@ START → classifier → plan_intent → field_collector → retriever → answe
 - `answerer`: `answer(question, items)` + `answerer_node(state)` wraps `get_chat_client()` / `get_async_chat_client()` `llm_model()` `TEMPERATURE 0.2` `MAX_TOKENS 900` `SYSTEM_PROMPT` rioplatense, returns `{answer, sources, input_tokens, output_tokens}`
 
 `AgentState` (`src/agent/state.py:1`): `question`, `intent`, `retrieved`, `answer`, `sources`, `plan_intent`, `divisions`, `location`, `history`.
+
+## Satellite NDVI — Sentinel-2 via Copernicus (separate from RAG, 2026-09-15)
+
+Decision: Sentinel-2 only, Auravant discarded. NDVI = reflectance `(B08-B04)/(B08+B04)`, never a diagnosis (red = possible stress OR bare soil/clouds — UI carries the disclaimer).
+
+- **Location contract** (`src/satellite/geo.py`, stdlib only): every input normalizes to `{polygon (GeoJSON EPSG:4326), centroid, area_ha, origin:{mode}, label?}`. Accepted: `{}` legacy, `{lat,lng,ha}` point+radius (1–20 ha → 32-vertex circle), `{vertices:[{lat,lng}|[lng,lat]]}` (auto-closes), `{bbox:{lat_min,...}}`, `{polygon}` or raw GeoJSON Polygon. Validation: Argentina bbox approx, ≤500 vertices, ≤50.000 ha. `POST /investigations` + `POST /plans` normalize (422 on invalid); `/plan/parse` still returns `{}`.
+- **Client** (`src/satellite/sentinel.py`, sync `httpx` like `rerank_client.py`): OAuth2 `client_credentials` against `identity.dataspace.copernicus.eu/.../CDSE/.../token` (token cached ~60s before expiry, single retry on 401) + `POST {SH_BASE}/api/v1/statistics` with NDVI evalscript (`B04/B08+dataMask`), Sentinel-2 L2A, `maxCloudCoverage:10`, P5D default (P1D optional). Empty (fully cloudy) buckets kept with `ndvi_mean: null`.
+- **Gotcha — resolution units:** Statistical API reads `resx/resy` in geometry CRS units → EPSG:4326 means **degrees** (`resolution_m / 111320`, ~0.0001° for 10m). Passing meters yields 1 giant pixel (`sample_count: 1`). Caught live 2026-09-15.
+- **Endpoints** (`src/api/main.py`): `GET /satellite/health` (token check, no PU spend) + `POST /satellite/ndvi {location|polygon, date_from?, date_to? (default last 90d), aggregation? P5D|P1D}` → `{series, polygon, centroid, area_ha, origin, aggregation, cached}`. Open (like `/plan/parse`); quota guard: 24h `TTLCache` keyed by polygon+dates+agg, max range 365d. Errors: 422 bad location/dates, 429 quota, 500 satellite misconfigured, 502 upstream.
+- **OAuth setup (martin does this, one per rotated secret):** login `dataspace.copernicus.eu` → profile → Sentinel Hub → User Settings → OAuth clients → Create (NOT a SPA — secret stays backend-only) → `SENTINEL_CLIENT_ID/SECRET` into `.env` (gitignored). Code reads `SENTINEL_*`; a bare `CLIENT_ID=` will silently miss (fail-fast exits 2 in demo).
+- **Free quota:** 10.000 req + 10.000 PU/month, 300/min (resets 1st). One P5D series ≈ 1 request.
+- **Verification:**
+  ```bash
+  uv run python scripts/satellite_demo.py            # live, needs creds
+  curl http://127.0.0.1:8002/satellite/health
+  curl -X POST http://127.0.0.1:8002/satellite/ndvi -H 'Content-Type: application/json' -d '{"location":{"lat":-34.5,"lng":-62.0,"ha":5}}'
+  ```
 
 ## Conventions
 
