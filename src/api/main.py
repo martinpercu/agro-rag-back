@@ -35,6 +35,7 @@ from agent.strategies.runner import (
     run_compare_stream,
 )
 from ingestion.vector_store import get_vector_store, vector_store_name
+from satellite.geo import normalize_location
 
 load_dotenv()
 
@@ -87,6 +88,7 @@ class InvestigationCreate(BaseModel):
     query: str | None = None
     edition_id: str | None = None
     divisions: list[dict] | None = None
+    # {} legacy (no field) or satellite contract: {polygon}|{lat,lng,ha}|{vertices}|{bbox}
     location: dict | None = None
     price_variants: list[float] | None = None
     client_hint: str | None = None
@@ -99,6 +101,7 @@ class PlanCreate(BaseModel):
     total_hectares: str | None = None
     season: str | None = None
     divisions: list[dict] | None = None
+    # {} legacy (no field) or satellite contract: {polygon}|{lat,lng,ha}|{vertices}|{bbox}
     location: dict | None = None
     price_variants: list[float] | None = None
     client_hint: str | None = None
@@ -444,12 +447,16 @@ async def create_investigation(body: InvestigationCreate, request: Request):
     db = next(gen)
     try:
         user = _ensure_user(db, payload)
+        try:
+            location = normalize_location(body.location)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
         inv = Investigation(
             user_id=user["id"],
             edition_id=body.edition_id or EDITION,
             query=body.query,
             divisions=body.divisions or [],
-            location=body.location or {},
+            location=location,
             price_variants=body.price_variants or [],
             client_hint=body.client_hint,
             meta=body.metadata or {},
@@ -496,6 +503,10 @@ async def create_plan(body: PlanCreate, request: Request):
     db = next(gen)
     try:
         user = _ensure_user(db, payload)
+        try:
+            location = normalize_location(body.location)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
         plan = Plan(
             user_id=user["id"],
             investigation_id=body.investigation_id,
@@ -503,7 +514,7 @@ async def create_plan(body: PlanCreate, request: Request):
             total_hectares=body.total_hectares,
             season=body.season,
             divisions=body.divisions or [],
-            location=body.location or {},
+            location=location,
             price_variants=body.price_variants or [],
             client_hint=body.client_hint,
             meta=body.metadata or {},
