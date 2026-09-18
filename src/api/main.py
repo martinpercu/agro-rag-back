@@ -713,6 +713,59 @@ class GraphRequest(BaseModel):
     history: list[dict] | None = None
 
 
+class ChatStreamRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=1000)
+    history: list[dict] | None = None
+    lang: str = "es"
+    k: int | None = Field(default=6, ge=1, le=20)
+    temperature: float | None = Field(default=None, ge=0, le=1)
+
+
+def _retrieved_to_items(retrieved: list) -> list:
+    """Convierte tuples (chunk_dict, score) del graph state a RetrievedItem.
+
+    Misma conversion que answerer_node — extraida para reusar en /chat/stream.
+    """
+    from agent.strategies.base import RetrievedItem
+
+    items: list = []
+    for chunk_dict, score in retrieved or []:
+        meta = chunk_dict.get("metadata", {})
+        items.append(
+            RetrievedItem(
+                chunk_id=chunk_dict.get("id", ""),
+                text=chunk_dict.get("text", ""),
+                seccion=meta.get("seccion"),
+                pagina=meta.get("pagina"),
+                cultivo=meta.get("cultivo"),
+                campana=meta.get("campana"),
+                tipo=meta.get("tipo"),
+                score=float(score),
+                rank=0,
+            )
+        )
+    return items
+
+
+def _run_graph_prefix(question: str, history: list[dict]) -> dict:
+    """Corre los 4 primeros nodos del grafo en orden (sync, para asyncio.to_thread).
+
+    classifier → plan_intent → field_collector → retriever.
+    Cada nodo abre su propio span en Langfuse si esta habilitado.
+    """
+    from agent.nodes.classifier import classifier_node
+    from agent.nodes.field_collector import field_collector_node
+    from agent.nodes.plan_intent import plan_intent_node
+    from agent.nodes.retriever import retriever_node
+
+    state: dict = {"question": question, "history": history}
+    state = classifier_node(state)
+    state = plan_intent_node(state)
+    state = field_collector_node(state)
+    state = retriever_node(state)
+    return state
+
+
 @app.post("/chat")
 async def chat(req: GraphRequest, request: Request) -> dict:
     """Chat producto: classifier→plan_intent→field_collector→retriever→answerer.
@@ -799,6 +852,208 @@ async def chat(req: GraphRequest, request: Request) -> dict:
         "divisions": result.get("divisions"),
         "location": result.get("location"),
     }
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatStreamRequest, request: Request) -> StreamingResponse:
+    """SSE del grafo producto: corre classifier→plan_intent→field_collector→retriever
+    y streamea el answerer token por token.
+
+    Body: {question, history?, lang?, k?, temperature?}
+
+    SSE events:
+      event: chat_meta   -> {intent, plan_intent, divisions, location, sources, retrieval_ms, num_sources}
+      event: chat_token  -> {text}
+      event: chat_done   -> {answer, sources, input_tokens, output_tokens, intent, plan_intent, divisions, location}
+      event: chat_error  -> {error}
+
+    Traza Langfuse user:chat_stream tags user (producto por usuario), con los 5 spans
+    anidados: los 4 nodos emiten sus spans y el answerer va como generation con
+    modelo + usage. Sin Langfuse (prod) el SSE es identico sin spans.
+
+    Nota: k se acepta por compatibilidad con el front pero el retriever del grafo
+    usa DEFAULT_K fijo (no se propaga en este baby-step); queda en el input del span.
+    """
+    import asyncio
+    import time
+
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
+
+    # Guard: preguntas no agropecuarias se rechazan sin gastar nada
+    if is_off_topic(req.question):
+        msg = (
+            "Preguntame sobre costos, márgenes, cultivos o ganadería de la revista Márgenes Agropecuarios."
+            if req.lang == "es"
+            else "Ask me about costs, margins, crops or livestock from Márgenes Agropecuarios magazine."
+        )
+
+        async def _reject():
+            yield f"event: chat_error\ndata: {json.dumps({'error': msg})}\n\n"
+
+        return StreamingResponse(
+            _reject(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    session_id = _extract_session_id(request)
+    lf = _get_langfuse()
+
+    async def _prefix():
+        """Corre los 4 nodos y devuelve (state, items, sources, retrieval_ms)."""
+        from agent.nodes.answerer import _format_sources_from_items
+
+        t0 = time.time()
+        try:
+            state = await asyncio.to_thread(_run_graph_prefix, req.question, req.history or [])
+        except Exception as e:
+            raise RuntimeError(f"graph_prefix_failed: {e}")
+        retrieval_ms = (time.time() - t0) * 1000
+        items = _retrieved_to_items(state.get("retrieved", []))
+        sources = _format_sources_from_items(items)
+        return state, items, sources, retrieval_ms
+
+    def _meta_payload(state: dict, sources: list, retrieval_ms: float) -> dict:
+        return {
+            "intent": state.get("intent"),
+            "plan_intent": state.get("plan_intent"),
+            "divisions": state.get("divisions", []),
+            "location": state.get("location", {}),
+            "sources": sources,
+            "retrieval_ms": round(retrieval_ms, 2),
+            "num_sources": len(sources),
+        }
+
+    async def _events_no_trace():
+        from agent.nodes.answerer import stream_answer_async
+
+        try:
+            state, items, sources, retrieval_ms = await _prefix()
+        except Exception as e:
+            yield f"event: chat_error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            return
+        yield f"event: chat_meta\ndata: {json.dumps(_meta_payload(state, sources, retrieval_ms))}\n\n"
+        try:
+            token_gen, usage = await stream_answer_async(req.question, items, req.temperature)
+            full_text = ""
+            async for token in token_gen:
+                full_text += token
+                yield f"event: chat_token\ndata: {json.dumps({'text': token})}\n\n"
+        except Exception as e:
+            yield f"event: chat_error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            return
+        yield (
+            "event: chat_done\n"
+            f"data: {json.dumps({'answer': full_text, 'sources': sources, 'input_tokens': usage['input_tokens'], 'output_tokens': usage['output_tokens'], 'intent': state.get('intent'), 'plan_intent': state.get('plan_intent'), 'divisions': state.get('divisions', []), 'location': state.get('location', {})})}\n\n"
+        )
+
+    _SSE_HEADERS = {
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+    if lf is None:
+        return StreamingResponse(_events_no_trace(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+    async def _events_traced():
+        from agent.llm import llm_model
+        from agent.nodes.answerer import stream_answer_async
+        from observability import (
+            start_as_current_observation,
+            update_current_generation,
+            update_current_observation,
+            flush,
+        )
+
+        try:
+            with start_as_current_observation(
+                name="user:chat_stream",
+                as_type="span",
+                input={
+                    "question": req.question,
+                    "history": req.history,
+                    "k": req.k or 6,
+                    "lang": req.lang,
+                },
+                session_id=session_id,
+                user_id=session_id,
+                tags=["user"],
+                metadata={"lang": req.lang, "temperature": req.temperature},
+            ):
+                try:
+                    state, items, sources, retrieval_ms = await _prefix()
+                except Exception as e:
+                    yield f"event: chat_error\ndata: {json.dumps({'error': str(e)})}\n\n"
+                    try:
+                        update_current_observation(output={"error": str(e)})
+                        flush()
+                    except Exception:
+                        pass
+                    return
+                yield f"event: chat_meta\ndata: {json.dumps(_meta_payload(state, sources, retrieval_ms))}\n\n"
+                full_text = ""
+                try:
+                    with start_as_current_observation(
+                        name="answerer",
+                        as_type="generation",
+                        input={"question": req.question, "retrieved_count": len(items)},
+                        model=llm_model(),
+                        metadata={"temperature": req.temperature},
+                    ):
+                        token_gen, usage = await stream_answer_async(req.question, items, req.temperature)
+                        async for token in token_gen:
+                            full_text += token
+                            yield f"event: chat_token\ndata: {json.dumps({'text': token})}\n\n"
+                    try:
+                        update_current_generation(
+                            output={"answer": full_text, "sources": sources},
+                            usage_details={
+                                "input": usage["input_tokens"],
+                                "output": usage["output_tokens"],
+                            },
+                            model=llm_model(),
+                        )
+                    except Exception:
+                        pass
+                except Exception as e:
+                    yield f"event: chat_error\ndata: {json.dumps({'error': str(e)})}\n\n"
+                    try:
+                        update_current_observation(output={"error": str(e)})
+                        flush()
+                    except Exception:
+                        pass
+                    return
+                yield (
+                    "event: chat_done\n"
+                    f"data: {json.dumps({'answer': full_text, 'sources': sources, 'input_tokens': usage['input_tokens'], 'output_tokens': usage['output_tokens'], 'intent': state.get('intent'), 'plan_intent': state.get('plan_intent'), 'divisions': state.get('divisions', []), 'location': state.get('location', {})})}\n\n"
+                )
+                try:
+                    update_current_observation(
+                        output={
+                            "answer": full_text,
+                            "intent": state.get("intent"),
+                            "plan_intent": state.get("plan_intent"),
+                            "divisions": state.get("divisions", []),
+                        }
+                    )
+                except Exception:
+                    pass
+                try:
+                    flush()
+                except Exception:
+                    pass
+        except Exception:
+            # Fallback sin Langfuse si el helper falla
+            async for chunk in _events_no_trace():
+                yield chunk
+
+    return StreamingResponse(_events_traced(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @app.get("/editions")
