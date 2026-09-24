@@ -98,5 +98,25 @@
     "expected_sections_any": ["general", "costos_margenes", "mercado_precios", "proyecciones"],
     "expected_cultivo_any": [null],
     "description": "Pregunta ambigua: clasificador cae en 'general', agente sin filtro de seccion"
+  },
+  {
+    "id": "en-maize-margin",
+    "question": "What is the gross margin for late maize?",
+    "expected_intent": "costos",
+    "expected_answer_contains": ["p. ", "US$/ha"],
+    "expected_answer_not_contains": ["I didn't find"],
+    "expected_sections_any": ["costos_margenes"],
+    "expected_cultivo_any": ["maiz"],
+    "description": "English question: answer must be in English with page cite and US$/ha"
+  },
+  {
+    "id": "en-soy-costs",
+    "question": "How much does it cost to plant first-season soybeans in the northern zone of Buenos Aires?",
+    "expected_intent": "costos",
+    "expected_answer_contains": ["p. ", "US$/ha"],
+    "expected_answer_not_contains": ["I didn't find"],
+    "expected_sections_any": ["costos_margenes", "costos_operativos"],
+    "expected_cultivo_any": ["soja"],
+    "description": "English question: answer must be in English with page cite and US$/ha"
   }
 ]

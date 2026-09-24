@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 from dotenv import load_dotenv
 
@@ -18,6 +19,55 @@ load_dotenv()
 
 MAX_TOKENS = 900
 TEMPERATURE = 0.2
+
+NO_ANSWER_ES = "En esta edicion no encontre informacion relevante para responder esto."
+NO_ANSWER_EN = "I didn't find relevant information to answer this in this edition."
+
+# Heurística de idioma sin dependencias: el default siempre es "es"
+# (audiencia productora argentina). Solo devolvemos "en" con evidencia clara.
+_ES_CHARS = frozenset("áéíóúüñ¿¡")
+_RIO_WORDS = frozenset(
+    {
+        "che", "mira", "fijate", "contame", "decime", "tenes", "podes",
+        "queres", "sabes", "dale", "tranqui", "chicos", "muchacho",
+    }
+)
+_EN_STOPWORDS = frozenset(
+    {
+        "the", "what", "how", "much", "many", "does", "do", "is", "are",
+        "was", "were", "for", "with", "from", "about", "which", "when",
+        "where", "there", "their", "your", "yours", "this", "that",
+        "corn", "soybean", "soybeans", "wheat", "yield", "price", "prices",
+        "cost", "costs", "margin", "margins", "farm", "field", "hectare",
+        "hectares", "versus", "between", "cattle", "steer", "livestock",
+    }
+)
+
+
+def detect_question_lang(question: str, fallback: str = "es") -> str:
+    """Detecta "es" o "en" para la pregunta, sin dependencias externas.
+
+    - Cualquier marca inequívoca de español (acentos/ñ/¿/¡ o voseo) -> "es".
+    - Si no, proporción de stopwords/cultivos en inglés -> "en".
+    - Cortas, mixtas o sin evidencia -> fallback (default "es").
+    """
+    q = (question or "").lower()
+    if not q.strip():
+        return fallback
+    if any(c in _ES_CHARS for c in q):
+        return "es"
+    words = re.findall(r"[a-zñ]+", q)
+    if not words:
+        return fallback
+    if any(w in _RIO_WORDS for w in words):
+        return "es"
+    en_hits = sum(1 for w in words if w in _EN_STOPWORDS)
+    ratio = en_hits / len(words)
+    if en_hits >= 2 and ratio >= 0.25:
+        return "en"
+    if len(words) <= 5 and ratio >= 0.5:
+        return "en"
+    return fallback
 
 SYSTEM_PROMPT = """\
 Sos Agroposta, un consejero agropecuario de confianza para productores \
@@ -71,6 +121,57 @@ segun el modelo. Fijate en la pagina 76 que esta toda la matriz." \
 EJEMPLO DE RESPUESTA MALA (no hacer esto) \
 "Yo creo que el kilo de novillo esta en 3,50 US$/kg mas o menos." \
 -> MAL: inventar un numero que no estaba en el contexto, no citar pagina. \
+"""
+
+SYSTEM_PROMPT_EN = """\
+You are Agroposta, a trusted farm advisor for Argentine producers. Your only \
+source of information is the edition of Margenes Agropecuarios magazine \
+passed below under "Magazine context". \
+
+HOW YOU SPEAK \
+- Clear, professional, plain English. No slang, no filler words. \
+- Always address the producer directly and concisely. \
+- No pedantry, no unexplained jargon. If a technical term is unavoidable, \
+  explain it in passing. \
+- Brevity first. Two or three short paragraphs. A few well-explained \
+  numbers beat a wall of text. \
+- If the producer asks about "next season" or "next year", interpret that \
+  as the 2026/27 season, which is what this edition covers. \
+
+HARD RULES (never break them) \
+1. NEVER INVENT. If a specific fact is not in the context, say textually \
+   "I didn't find relevant information to answer this in this edition." \
+   and offer alternatives that DO appear. \
+2. ALWAYS cite the page in parentheses, e.g. "(p. 38)" or "(pp. 26-31)". \
+   If the section helps, mention it (e.g. "Costs and margins section"). \
+3. NUMBERS: when a table has several scenarios (e.g. "basic / feedlot / \
+   full cycle"), give the FULL RANGE, not a single value. E.g.: "steers \
+   run between 3.16 and 3.72 US$/kg depending on the system". \
+4. If the question is ambiguous, politely ask for clarification before \
+   throwing numbers. \
+5. Don't recommend beyond what the magazine says. You are not a financial \
+   advisor or an agronomist: you interpret Margenes. \
+
+ANSWER STRUCTURE \
+- Start with the main conclusion in one or two sentences. \
+- Then the key numbers with units (US$/ha, qq/ha, US$/kg, etc). \
+- Close with a practical recommendation or the producer's next step. \
+- If the answer runs long, cut it. Short and useful beats long and complete. \
+
+GOOD ANSWER EXAMPLE \
+Question: "How much is a kilo of feedlot steer?" \
+Answer: \
+"It depends on the system, but in this edition feedlot steer goes from \
+3.16 to 3.72 US$/kg (p. 76, Livestock section). On a basic full-cycle \
+system you are near 3.16 US$/kg, and adding feedlot on top of backgrounding \
+takes you to 3.72 US$/kg. Kilos sold per ha range from 92 to almost 148 net \
+kg depending on how intensive the system is. \
+Before deciding, look closely at direct costs: they run from 131 to 235 \
+US$/ha by model. Page 76 has the full matrix." \
+
+BAD ANSWER EXAMPLE (don't do this) \
+"I think feedlot steer is around 3.50 US$/kg, more or less." \
+-> WRONG: invented a number not in the context, no page cited. \
 """
 
 
@@ -172,13 +273,27 @@ async def stream_answer_async(
     """
     usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
     temp = temperature if temperature is not None else TEMPERATURE
+    lang = detect_question_lang(question)
+    system_prompt = SYSTEM_PROMPT_EN if lang == "en" else SYSTEM_PROMPT
+    context = _format_context_from_items(items)
+    if lang == "en":
+        user_content = (
+            f"Producer question: {question}\n\n"
+            f"Magazine context:\n{context}\n\n"
+            "Answer following your personality and hard rules."
+        )
+    else:
+        user_content = (
+            f"Pregunta del productor: {question}\n\n"
+            f"Contexto de la revista:\n{context}\n\n"
+            "Responde siguiendo tu personalidad y las reglas duras."
+        )
 
     async def _generate():
         if not items:
-            yield "En esta edicion no encontre informacion relevante para responder esto."
+            yield NO_ANSWER_EN if lang == "en" else NO_ANSWER_ES
             return
 
-        context = _format_context_from_items(items)
         client = get_async_chat_client()
         response = await client.chat.completions.create(
             model=llm_model(),
@@ -188,15 +303,8 @@ async def stream_answer_async(
             stream=True,
             stream_options={"include_usage": True},
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Pregunta del productor: {question}\n\n"
-                        f"Contexto de la revista:\n{context}\n\n"
-                        "Responde siguiendo tu personalidad y las reglas duras."
-                    ),
-                },
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
             ],
         )
         async for chunk in response:
@@ -216,16 +324,31 @@ def answer(question: str, items: list[RetrievedItem], temperature: float | None 
     """
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY no encontrada. Define el .env en la raiz.")
+    lang = detect_question_lang(question)
     if not items:
         return {
-            "answer": "En esta edicion no encontre informacion relevante para responder esto.",
+            "answer": NO_ANSWER_EN if lang == "en" else NO_ANSWER_ES,
             "sources": [],
             "input_tokens": 0,
             "output_tokens": 0,
+            "lang": lang,
         }
     temp = temperature if temperature is not None else TEMPERATURE
     context = _format_context_from_items(items)
     sources = _format_sources_from_items(items)
+    system_prompt = SYSTEM_PROMPT_EN if lang == "en" else SYSTEM_PROMPT
+    if lang == "en":
+        user_content = (
+            f"Producer question: {question}\n\n"
+            f"Magazine context:\n{context}\n\n"
+            "Answer following your personality and hard rules."
+        )
+    else:
+        user_content = (
+            f"Pregunta del productor: {question}\n\n"
+            f"Contexto de la revista:\n{context}\n\n"
+            "Responde siguiendo tu personalidad y las reglas duras."
+        )
     client = get_chat_client()
     response = client.chat.completions.create(
         model=llm_model(),
@@ -233,15 +356,8 @@ def answer(question: str, items: list[RetrievedItem], temperature: float | None 
         temperature=temp,
         seed=seed_for_temperature(temp),
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Pregunta del productor: {question}\n\n"
-                    f"Contexto de la revista:\n{context}\n\n"
-                    "Responde siguiendo tu personalidad y las reglas duras."
-                ),
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
         ],
     )
     answer_text = response.choices[0].message.content or ""
@@ -252,6 +368,7 @@ def answer(question: str, items: list[RetrievedItem], temperature: float | None 
         "sources": sources,
         "input_tokens": in_tok,
         "output_tokens": out_tok,
+        "lang": lang,
     }
 
 
@@ -293,7 +410,7 @@ def answerer_node(state: AgentState) -> AgentState:
                 as_type="generation",
                 input={"question": question, "history": history, "retrieved_count": len(items)},
                 model=llm_model(),
-                metadata={"temperature": TEMPERATURE},
+                metadata={"temperature": TEMPERATURE, "answer_lang": detect_question_lang(question)},
             ) as _gen:
                 result = answer(question, items)
                 state["answer"] = result["answer"]
